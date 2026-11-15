@@ -540,10 +540,20 @@ export const Client: React.FC<ClientProps> = ({
   const createClientPeerConnection = useCallback(
     (stream: MediaStream | null, sessionId: string): RTCPeerConnection => {
       if (pcRef.current) {
+        console.log(
+          `[CLIENT-RTC][${clientId}][${currentSessionIdRef.current}] Closing previous RTCPeerConnection before creating new session (${sessionId})`,
+          {
+            prevConnectionState: pcRef.current.connectionState,
+            prevIceConnectionState: pcRef.current.iceConnectionState,
+            prevSignalingState: pcRef.current.signalingState,
+          }
+        );
         try {
           pcRef.current.onicecandidate = null;
           pcRef.current.onconnectionstatechange = null;
           pcRef.current.oniceconnectionstatechange = null;
+          pcRef.current.onsignalingstatechange = null;
+          pcRef.current.onicegatheringstatechange = null;
           pcRef.current.close();
         } catch {}
       }
@@ -561,6 +571,18 @@ export const Client: React.FC<ClientProps> = ({
           ? amplifiedStreamRef.current
           : stream || rawStreamRef.current;
 
+      console.log(
+        `[CLIENT-RTC][${clientId}][${sessionId}] Created RTCPeerConnection`,
+        {
+          hasAudioStream: Boolean(
+            activeStream && activeStream.getAudioTracks().length > 0
+          ),
+          audioTracksCount: activeStream ? activeStream.getAudioTracks().length : 0,
+          audioCtxState: audioCtxRef.current?.state || 'none',
+          iceServers: RTC_CONFIG.iceServers,
+        }
+      );
+
       if (activeStream && activeStream.getAudioTracks().length > 0) {
         activeStream.getAudioTracks().forEach((track) => {
           track.enabled = !mutedRef.current;
@@ -569,16 +591,37 @@ export const Client: React.FC<ClientProps> = ({
               direction: 'sendonly',
               streams: [activeStream],
             });
-          } catch {
+            console.log(
+              `[CLIENT-RTC][${clientId}][${sessionId}] Added audio transceiver (sendonly) with track:`,
+              { id: track.id, label: track.label, readyState: track.readyState }
+            );
+          } catch (transceiverErr) {
+            console.warn(
+              `[CLIENT-RTC][${clientId}][${sessionId}] addTransceiver failed, falling back to addTrack:`,
+              transceiverErr
+            );
             try {
               pc.addTrack(track, activeStream);
-            } catch {}
+            } catch (addTrackErr) {
+              console.error(
+                `[CLIENT-RTC][${clientId}][${sessionId}] addTrack failed:`,
+                addTrackErr
+              );
+            }
           }
         });
       } else {
         try {
           pc.addTransceiver('audio', { direction: 'sendonly' });
-        } catch {}
+          console.log(
+            `[CLIENT-RTC][${clientId}][${sessionId}] Added recv/sendonly placeholder audio transceiver (no mic track yet)`
+          );
+        } catch (err) {
+          console.warn(
+            `[CLIENT-RTC][${clientId}][${sessionId}] Failed to add placeholder audio transceiver:`,
+            err
+          );
+        }
       }
 
       // Buat DataChannel 'tactical-telemetry' untuk pengiriman posisi GPS ke Master
@@ -588,9 +631,34 @@ export const Client: React.FC<ClientProps> = ({
       dcRef.current = dc;
 
       dc.onopen = () => {
+        console.log(
+          `[CLIENT-RTC][${clientId}][${sessionId}] DataChannel 'tactical-telemetry' OPEN`,
+          {
+            readyState: dc.readyState,
+            connectionState: pc.connectionState,
+            iceConnectionState: pc.iceConnectionState,
+          }
+        );
         setPeerStatus('CONNECTED');
         setStatus('TERHUBUNG KE MASTER');
         transmitTelemetryPacket();
+      };
+
+      dc.onclose = () => {
+        console.warn(
+          `[CLIENT-RTC][${clientId}][${sessionId}] DataChannel 'tactical-telemetry' CLOSED`,
+          {
+            connectionState: pc.connectionState,
+            iceConnectionState: pc.iceConnectionState,
+          }
+        );
+      };
+
+      dc.onerror = (dcErr) => {
+        console.error(
+          `[CLIENT-RTC][${clientId}][${sessionId}] DataChannel 'tactical-telemetry' ERROR:`,
+          dcErr
+        );
       };
 
       dc.onmessage = (event) => {
@@ -606,9 +674,30 @@ export const Client: React.FC<ClientProps> = ({
 
       // Kirim setiap ICE Candidate melalui jalur ganda (WebSocket + HTTP /api/signal) dengan sessionId
       pc.onicecandidate = (event: RTCPeerConnectionIceEvent) => {
-        if (currentSessionIdRef.current !== sessionId) return;
+        if (currentSessionIdRef.current !== sessionId) {
+          console.warn(
+            `[CLIENT-RTC][${clientId}][${sessionId}] Ignoring onicecandidate for stale session (active=${currentSessionIdRef.current})`
+          );
+          return;
+        }
         if (event.candidate && event.candidate.candidate) {
           const candidateJson = event.candidate.toJSON();
+          console.log(
+            `[CLIENT-RTC][${clientId}][${sessionId}] onicecandidate -> Local ICE candidate generated, sending to MASTER:`,
+            {
+              type: event.candidate.type,
+              protocol: event.candidate.protocol,
+              address: event.candidate.address,
+              port: event.candidate.port,
+              sdpMid: event.candidate.sdpMid,
+              sdpMLineIndex: event.candidate.sdpMLineIndex,
+              candidate: event.candidate.candidate,
+              iceGatheringState: pc.iceGatheringState,
+              iceConnectionState: pc.iceConnectionState,
+              connectionState: pc.connectionState,
+              signalingState: pc.signalingState,
+            }
+          );
           void sendSignalingPacket({
             type: 'candidate',
             senderId: clientId,
@@ -618,13 +707,77 @@ export const Client: React.FC<ClientProps> = ({
             candidate: candidateJson,
             data: candidateJson,
           });
+        } else {
+          console.log(
+            `[CLIENT-RTC][${clientId}][${sessionId}] onicecandidate -> ICE gathering complete (null candidate)`,
+            {
+              iceGatheringState: pc.iceGatheringState,
+              iceConnectionState: pc.iceConnectionState,
+              connectionState: pc.connectionState,
+              signalingState: pc.signalingState,
+            }
+          );
         }
       };
 
-      const checkConnState = () => {
+      pc.onicegatheringstatechange = () => {
+        if (pcRef.current !== pc) return;
+        console.log(
+          `[CLIENT-RTC][${clientId}][${sessionId}] onicegatheringstatechange -> ${pc.iceGatheringState}`,
+          {
+            iceGatheringState: pc.iceGatheringState,
+            iceConnectionState: pc.iceConnectionState,
+            connectionState: pc.connectionState,
+            signalingState: pc.signalingState,
+          }
+        );
+      };
+
+      pc.onsignalingstatechange = () => {
+        if (pcRef.current !== pc) return;
+        console.log(
+          `[CLIENT-RTC][${clientId}][${sessionId}] onsignalingstatechange -> ${pc.signalingState}`,
+          {
+            signalingState: pc.signalingState,
+            iceConnectionState: pc.iceConnectionState,
+            connectionState: pc.connectionState,
+            iceGatheringState: pc.iceGatheringState,
+          }
+        );
+      };
+
+      pc.onicecandidateerror = (event: RTCPeerConnectionIceErrorEvent) => {
+        console.warn(
+          `[CLIENT-RTC][${clientId}][${sessionId}] onicecandidateerror:`,
+          {
+            errorCode: event.errorCode,
+            errorText: event.errorText,
+            url: event.url,
+            address: event.address,
+            port: event.port,
+          }
+        );
+      };
+
+      pc.onconnectionstatechange = () => {
         if (pcRef.current !== pc) return;
         const st = pc.connectionState;
         const iceSt = pc.iceConnectionState;
+        console.log(
+          `[CLIENT-RTC][${clientId}][${sessionId}] onconnectionstatechange -> ${st}`,
+          {
+            connectionState: st,
+            iceConnectionState: iceSt,
+            iceGatheringState: pc.iceGatheringState,
+            signalingState: pc.signalingState,
+            dcReadyState: dcRef.current?.readyState || 'none',
+          }
+        );
+        if (st === 'failed' || st === 'disconnected') {
+          console.warn(
+            `[CLIENT-RTC][${clientId}][${sessionId}] PeerConnection state degraded: ${st} (ice=${iceSt})`
+          );
+        }
         if (
           st === 'connected' ||
           iceSt === 'connected' ||
@@ -637,8 +790,36 @@ export const Client: React.FC<ClientProps> = ({
         }
       };
 
-      pc.onconnectionstatechange = checkConnState;
-      pc.oniceconnectionstatechange = checkConnState;
+      pc.oniceconnectionstatechange = () => {
+        if (pcRef.current !== pc) return;
+        const st = pc.connectionState;
+        const iceSt = pc.iceConnectionState;
+        console.log(
+          `[CLIENT-RTC][${clientId}][${sessionId}] oniceconnectionstatechange -> ${iceSt}`,
+          {
+            iceConnectionState: iceSt,
+            connectionState: st,
+            iceGatheringState: pc.iceGatheringState,
+            signalingState: pc.signalingState,
+            dcReadyState: dcRef.current?.readyState || 'none',
+          }
+        );
+        if (iceSt === 'failed' || iceSt === 'disconnected') {
+          console.warn(
+            `[CLIENT-RTC][${clientId}][${sessionId}] ICE Connection state degraded: ${iceSt} (conn=${st})`
+          );
+        }
+        if (
+          st === 'connected' ||
+          iceSt === 'connected' ||
+          iceSt === 'completed'
+        ) {
+          isHandshakingRef.current = false;
+          setPeerStatus('CONNECTED');
+          setStatus('TERHUBUNG KE MASTER');
+          transmitTelemetryPacket();
+        }
+      };
 
       return pc;
     },
@@ -652,27 +833,54 @@ export const Client: React.FC<ClientProps> = ({
       try {
         isHandshakingRef.current = true;
         lastOfferSentAtRef.current = Date.now();
+        console.log(
+          `[CLIENT-RTC][${clientId}][${sessionId}] Creating SDP Offer...`,
+          {
+            signalingState: pc.signalingState,
+            iceConnectionState: pc.iceConnectionState,
+            connectionState: pc.connectionState,
+          }
+        );
         const offer = await pc.createOffer();
-        if (currentSessionIdRef.current !== sessionId) return;
+        if (currentSessionIdRef.current !== sessionId) {
+          console.warn(
+            `[CLIENT-RTC][${clientId}][${sessionId}] Aborting Offer: session superseded by ${currentSessionIdRef.current}`
+          );
+          return;
+        }
         await pc.setLocalDescription(offer);
+        console.log(
+          `[CLIENT-RTC][${clientId}][${sessionId}] setLocalDescription(offer) succeeded`,
+          {
+            signalingState: pc.signalingState,
+            sdpLength: pc.localDescription?.sdp?.length || 0,
+          }
+        );
 
         if (pc.localDescription && currentSessionIdRef.current === sessionId) {
           const sdpObj = {
             type: pc.localDescription.type,
             sdp: pc.localDescription.sdp,
           };
+          const packetId = makePacketId('c-off');
+          console.log(
+            `[CLIENT-RTC][${clientId}][${sessionId}] Dispatching SDP Offer to MASTER (packetId=${packetId})`
+          );
           await sendSignalingPacket({
             type: 'offer',
             senderId: clientId,
             targetId: 'MASTER',
             sessionId,
-            packetId: makePacketId('c-off'),
+            packetId,
             sdp: sdpObj,
             data: sdpObj,
           });
         }
       } catch (err) {
-        console.error('[CLIENT] Gagal membuat/mengirim Offer:', err);
+        console.error(
+          `[CLIENT-RTC][${clientId}][${sessionId}] Gagal membuat/mengirim Offer:`,
+          err
+        );
       } finally {
         setTimeout(() => {
           isHandshakingRef.current = false;
@@ -722,6 +930,14 @@ export const Client: React.FC<ClientProps> = ({
             existingPc.connectionState === 'connecting' ||
             existingPc.signalingState === 'have-local-offer')
         ) {
+          console.log(
+            `[CLIENT-RTC][${clientId}][${currentSessionIdRef.current}] Skipping startWebRTC: handshake already in progress (${timeSinceLastOffer}ms ago)`,
+            {
+              signalingState: existingPc.signalingState,
+              iceConnectionState: existingPc.iceConnectionState,
+              connectionState: existingPc.connectionState,
+            }
+          );
           return;
         }
       }
@@ -742,17 +958,25 @@ export const Client: React.FC<ClientProps> = ({
         const newSessionId = `sess-${Date.now()}-${Math.random()
           .toString(36)
           .substring(2, 7)}`;
+        console.log(
+          `[CLIENT-RTC][${clientId}] Starting new WebRTC negotiation session: ${newSessionId} (forceReset=${forceReset})`
+        );
         const pc = createClientPeerConnection(stream, newSessionId);
         await sendOfferOverSignaling(pc, newSessionId);
       } catch (err) {
-        console.error('[CLIENT] Error di dalam startWebRTC():', err);
+        console.error('[CLIENT-RTC] Error di dalam startWebRTC():', err);
       } finally {
         setTimeout(() => {
           isHandshakingRef.current = false;
         }, 800);
       }
     },
-    [createClientPeerConnection, ensureMicrophoneStream, sendOfferOverSignaling]
+    [
+      clientId,
+      createClientPeerConnection,
+      ensureMicrophoneStream,
+      sendOfferOverSignaling,
+    ]
   );
 
   // Proses pesan masuk dari Master (via WebSocket maupun HTTP Polling)
@@ -777,6 +1001,14 @@ export const Client: React.FC<ClientProps> = ({
       }
 
       if (data.type === 'master_online') {
+        console.log(
+          `[CLIENT-RTC][${clientId}] Received 'master_online' signal from MASTER`,
+          {
+            activeSessionId: currentSessionIdRef.current,
+            connectionState: pcRef.current?.connectionState || 'none',
+            iceConnectionState: pcRef.current?.iceConnectionState || 'none',
+          }
+        );
         setPeerStatus('CONNECTED');
         setStatus('TERHUBUNG KE MASTER');
         const pc = pcRef.current;
@@ -800,6 +1032,9 @@ export const Client: React.FC<ClientProps> = ({
         currentSessionIdRef.current &&
         data.sessionId !== currentSessionIdRef.current
       ) {
+        console.warn(
+          `[CLIENT-RTC][${clientId}] Dropping signaling message (${data.type}) with mismatched sessionId: incoming=${data.sessionId}, active=${currentSessionIdRef.current}`
+        );
         return;
       }
 
@@ -814,27 +1049,69 @@ export const Client: React.FC<ClientProps> = ({
       ) {
         try {
           const pc = pcRef.current;
+          console.log(
+            `[CLIENT-RTC][${clientId}][${currentSessionIdRef.current}] Received SDP Answer from MASTER`,
+            {
+              incomingSessionId: data.sessionId,
+              packetId: data.packetId,
+              signalingState: pc.signalingState,
+              iceConnectionState: pc.iceConnectionState,
+              connectionState: pc.connectionState,
+              queuedCandidatesCount: pendingCandidatesRef.current.length,
+            }
+          );
           if (pc.signalingState === 'have-local-offer') {
             await pc.setRemoteDescription(
               new RTCSessionDescription(sdpPayload)
             );
             isRemoteDescReadyRef.current = true;
+            console.log(
+              `[CLIENT-RTC][${clientId}][${currentSessionIdRef.current}] setRemoteDescription(answer) succeeded`,
+              {
+                signalingState: pc.signalingState,
+                iceConnectionState: pc.iceConnectionState,
+                connectionState: pc.connectionState,
+              }
+            );
             setPeerStatus('CONNECTED');
             setStatus('TERHUBUNG KE MASTER');
 
             const queue = pendingCandidatesRef.current;
+            if (queue.length > 0) {
+              console.log(
+                `[CLIENT-RTC][${clientId}][${currentSessionIdRef.current}] Draining ${queue.length} queued remote ICE candidates from MASTER`
+              );
+            }
             while (queue.length > 0) {
               const cand = queue.shift();
               if (cand && cand.candidate) {
                 await pc
                   .addIceCandidate(new RTCIceCandidate(cand))
-                  .catch(() => {});
+                  .then(() => {
+                    console.log(
+                      `[CLIENT-RTC][${clientId}][${currentSessionIdRef.current}] Applied queued remote ICE candidate:`,
+                      cand.candidate
+                    );
+                  })
+                  .catch((candErr) => {
+                    console.warn(
+                      `[CLIENT-RTC][${clientId}][${currentSessionIdRef.current}] Failed to apply queued remote ICE candidate:`,
+                      candErr
+                    );
+                  });
               }
             }
             transmitTelemetryPacket();
+          } else {
+            console.warn(
+              `[CLIENT-RTC][${clientId}][${currentSessionIdRef.current}] Ignored SDP Answer because signalingState is '${pc.signalingState}' (expected 'have-local-offer')`
+            );
           }
         } catch (err) {
-          console.error('[CLIENT] Gagal setRemoteDescription(answer):', err);
+          console.error(
+            `[CLIENT-RTC][${clientId}][${currentSessionIdRef.current}] Gagal setRemoteDescription(answer):`,
+            err
+          );
         }
         return;
       }
@@ -856,10 +1133,29 @@ export const Client: React.FC<ClientProps> = ({
             isRemoteDescReadyRef.current
           ) {
             await pc.addIceCandidate(new RTCIceCandidate(candidatePayload));
+            console.log(
+              `[CLIENT-RTC][${clientId}][${currentSessionIdRef.current}] Added remote ICE candidate from MASTER immediately:`,
+              {
+                candidate: candidatePayload.candidate,
+                sdpMid: candidatePayload.sdpMid,
+                sdpMLineIndex: candidatePayload.sdpMLineIndex,
+                iceConnectionState: pc.iceConnectionState,
+                connectionState: pc.connectionState,
+              }
+            );
           } else {
             pendingCandidatesRef.current.push(candidatePayload);
+            console.log(
+              `[CLIENT-RTC][${clientId}][${currentSessionIdRef.current}] Queued remote ICE candidate from MASTER (remoteDescription not ready yet, queueSize=${pendingCandidatesRef.current.length}):`,
+              candidatePayload.candidate
+            );
           }
-        } catch {}
+        } catch (candErr) {
+          console.warn(
+            `[CLIENT-RTC][${clientId}][${currentSessionIdRef.current}] addIceCandidate error:`,
+            candErr
+          );
+        }
         return;
       }
 
