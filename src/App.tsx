@@ -41,8 +41,8 @@ export default function App() {
 
   const [pairedNodeId, setPairedNodeId] = useState<string | undefined>(() => {
     const params = new URLSearchParams(window.location.search);
-    const id = params.get('id');
-    return id && /^\d{4}$/.test(id) ? id : undefined;
+    const id = params.get('id')?.trim();
+    return id ? id : undefined;
   });
 
   const [pairedMasterId, setPairedMasterId] = useState<string | undefined>(() => {

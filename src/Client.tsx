@@ -37,6 +37,8 @@ interface SignalingMessage {
   senderId?: string;
   targetId?: string;
   target?: string;
+  sessionId?: string;
+  packetId?: string;
   sdp?: RTCSessionDescriptionInit;
   candidate?: RTCIceCandidateInit;
   data?: unknown;
@@ -79,14 +81,27 @@ function getSignalingWebSocketUrl(): string {
   return `${protocol}//${window.location.host}/ws`;
 }
 
+function makePacketId(prefix: string): string {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
+}
+
 export const Client: React.FC<ClientProps> = ({
   onExit,
   initialNodeId,
 }) => {
   const [clientId] = useState<string>(() => {
-    if (initialNodeId) return initialNodeId;
-    const randomSuffix = Math.random().toString(36).substring(2, 6).toUpperCase();
-    return `SENSOR-${randomSuffix}`;
+    if (initialNodeId && initialNodeId.trim()) {
+      return initialNodeId.trim();
+    }
+    try {
+      const saved = sessionStorage.getItem('sigma_active_client_id');
+      if (saved) return saved;
+      const generated = String(Math.floor(1000 + Math.random() * 9000));
+      sessionStorage.setItem('sigma_active_client_id', generated);
+      return generated;
+    } catch {
+      return String(Math.floor(1000 + Math.random() * 9000));
+    }
   });
 
   const [status, setStatus] = useState<string>('MENGHUBUNGKAN KE MASTER...');
@@ -125,25 +140,31 @@ export const Client: React.FC<ClientProps> = ({
   const wsRef = useRef<WebSocket | null>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const dcRef = useRef<RTCDataChannel | null>(null);
-  const rawStreamRef = useRef<MediaStream | null>(null);
-  const amplifiedStreamRef = useRef<MediaStream | null>(null);
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const gainNodeRef = useRef<GainNode | null>(null);
-  const wakeLockRef = useRef<WakeLockSentinel | null>(null);
+  const currentSessionIdRef = useRef<string>('');
+  const seenPacketIdsRef = useRef<Set<string>>(new Set());
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const isRemoteDescReadyRef = useRef<boolean>(false);
   const isHandshakingRef = useRef<boolean>(false);
+  const isBootstrappingRef = useRef<boolean>(false);
   const isManualDisconnectedRef = useRef<boolean>(false);
   const lastOfferSentAtRef = useRef<number>(0);
   const micInFlightRef = useRef<Promise<MediaStream | null> | null>(null);
   const connectWsFnRef = useRef<(() => void) | null>(null);
 
+  const rawStreamRef = useRef<MediaStream | null>(null);
+  const amplifiedStreamRef = useRef<MediaStream | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const gainNodeRef = useRef<GainNode | null>(null);
+  const wakeLockRef = useRef<WakeLockSentinel | null>(null);
+
+  const peerStatusRef = useRef(peerStatus);
   const gpsRef = useRef(gpsCoords);
   const batteryRef = useRef(batteryInfo);
   const rmsRef = useRef(audioRms);
   const gainValueRef = useRef(sensitivityGain);
   const mutedRef = useRef(isMuted);
 
+  peerStatusRef.current = peerStatus;
   gpsRef.current = gpsCoords;
   batteryRef.current = batteryInfo;
   rmsRef.current = audioRms;
@@ -222,23 +243,41 @@ export const Client: React.FC<ClientProps> = ({
     }
   }, []);
 
-  // Kirim sinyal via HTTP (/api/signal) sebagai jalur cadangan anti-gagal
-  const postHttpSignal = useCallback(async (packet: Record<string, unknown>) => {
-    if (isManualDisconnectedRef.current) return;
-    try {
-      const res = await fetch('/api/signal', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(packet),
-      });
-      if (res.ok && !isManualDisconnectedRef.current) {
-        setPeerStatus('CONNECTED');
-        setStatus('TERHUBUNG KE MASTER');
+  // Fungsi pengiriman sinyal jalur ganda (WebSocket + HTTP /api/signal dengan packetId anti-duplikat)
+  const sendSignalingPacket = useCallback(
+    async (packet: Record<string, unknown>) => {
+      if (isManualDisconnectedRef.current) return;
+      const payload = {
+        ...packet,
+        packetId:
+          typeof packet.packetId === 'string'
+            ? packet.packetId
+            : makePacketId('c-sig'),
+      };
+
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        try {
+          wsRef.current.send(JSON.stringify(payload));
+        } catch {}
       }
-    } catch {}
-  }, []);
+
+      try {
+        const res = await fetch('/api/signal', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (res.ok && !isManualDisconnectedRef.current) {
+          setPeerStatus('CONNECTED');
+          setStatus('TERHUBUNG KE MASTER');
+        }
+      } catch {}
+    },
+    []
+  );
 
   // Fungsi kirim Telemetri GPS & Status ke Master via DataChannel ('tactical-telemetry'), WebSocket, & HTTP
+  // PENTING: Tidak bergantung pada state `peerStatus` agar referensi fungsi selalu stabil!
   const transmitTelemetryPacket = useCallback(
     (overrideCoords?: {
       lat: number | null;
@@ -287,41 +326,23 @@ export const Client: React.FC<ClientProps> = ({
         connectionStatus: 'connected',
       };
 
-      let sentViaWsOrDc = false;
-
-      // 1. Kirim via RTCDataChannel ('tactical-telemetry')
+      // 1. Kirim via RTCDataChannel ('tactical-telemetry') bila terbuka
       if (dcRef.current && dcRef.current.readyState === 'open') {
         try {
           dcRef.current.send(JSON.stringify(gpsUpdatePacket));
           dcRef.current.send(JSON.stringify(sigmaTelemetryPacket));
-          sentViaWsOrDc = true;
         } catch {}
       }
 
-      // 2. Kirim via WebSocket Signaling
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        try {
-          wsRef.current.send(
-            JSON.stringify({
-              ...sigmaTelemetryPacket,
-              senderId: clientId,
-              targetId: 'MASTER',
-            })
-          );
-          sentViaWsOrDc = true;
-        } catch {}
-      }
-
-      // 3. Kirim via HTTP /api/signal agar Master selalu menerima posisi & status klien
-      if (!sentViaWsOrDc || peerStatus !== 'CONNECTED') {
-        void postHttpSignal({
-          ...sigmaTelemetryPacket,
-          senderId: clientId,
-          targetId: 'MASTER',
-        });
-      }
+      // 2. Kirim via WebSocket & HTTP /api/signal agar Master selalu menerima posisi & status klien
+      void sendSignalingPacket({
+        ...sigmaTelemetryPacket,
+        senderId: clientId,
+        targetId: 'MASTER',
+        packetId: makePacketId('c-tel'),
+      });
     },
-    [clientId, peerStatus, postHttpSignal]
+    [clientId, sendSignalingPacket]
   );
 
   // Akuisisi Mikrofon & Penguatan GainNode 300% (3.0x) TANPA memblokir WebSocket/WebRTC
@@ -344,7 +365,6 @@ export const Client: React.FC<ClientProps> = ({
 
       let rawStream: MediaStream | null = null;
       try {
-        // Coba constraint audio taktis (EC: false, NS: false, AGC: false) dengan batas waktu 3.5 detik agar tidak hang
         rawStream = await Promise.race([
           navigator.mediaDevices
             .getUserMedia({
@@ -359,7 +379,7 @@ export const Client: React.FC<ClientProps> = ({
               navigator.mediaDevices.getUserMedia({ audio: true, video: false })
             ),
           new Promise<MediaStream | null>((resolve) =>
-            setTimeout(() => resolve(null), 3500)
+            setTimeout(() => resolve(null), 2500)
           ),
         ]);
       } catch {
@@ -377,7 +397,7 @@ export const Client: React.FC<ClientProps> = ({
       rawStreamRef.current = rawStream;
       setMicStatus('READY');
 
-      // Setup AudioContext + GainNode (3.0x / 300%) tanpa await resume() agar tidak pernah hang di browser seluler
+      // Setup AudioContext + GainNode (3.0x / 300%) tanpa await resume()
       try {
         const AudioContextClass =
           window.AudioContext ||
@@ -386,7 +406,6 @@ export const Client: React.FC<ClientProps> = ({
         const audioCtx = new AudioContextClass();
         audioCtxRef.current = audioCtx;
 
-        // Jangan gunakan await di sini karena mobile browser akan menahan Promise resume() sampai layar disentuh
         if (audioCtx.state === 'suspended') {
           audioCtx.resume().catch(() => {});
         }
@@ -407,19 +426,24 @@ export const Client: React.FC<ClientProps> = ({
 
         amplifiedStreamRef.current = destination.stream;
 
-        // Bila AudioContext beralih ke running, pastikan sender WebRTC memakai track yang telah diperkuat 300%
-        audioCtx.onstatechange = () => {
+        // Jika AudioContext sudah running, langsung pasang track hasil penguatan 300% ke sender WebRTC yang aktif
+        const attachAmplifiedTrackToActivePc = () => {
           if (
-            audioCtx.state === 'running' &&
             pcRef.current &&
             destination.stream.getAudioTracks().length > 0
           ) {
             const ampTrack = destination.stream.getAudioTracks()[0];
             pcRef.current.getSenders().forEach((sender) => {
-              if (sender.track && sender.track.kind === 'audio') {
+              if (!sender.track || sender.track.kind === 'audio') {
                 sender.replaceTrack(ampTrack).catch(() => {});
               }
             });
+          }
+        };
+
+        audioCtx.onstatechange = () => {
+          if (audioCtx.state === 'running') {
+            attachAmplifiedTrackToActivePc();
           }
         };
 
@@ -448,7 +472,7 @@ export const Client: React.FC<ClientProps> = ({
         };
         requestAnimationFrame(updateMeter);
 
-        // Jalur Audio Fallback via WebSocket (SIGMA_WS_AUDIO) jika UDP WebRTC terhambat
+        // Jalur Audio Fallback via WebSocket (SIGMA_WS_AUDIO) bila WebRTC ICE belum terbentuk
         try {
           const processor = audioCtx.createScriptProcessor(4096, 1, 1);
           const silentSink = audioCtx.createGain();
@@ -512,9 +536,9 @@ export const Client: React.FC<ClientProps> = ({
     }
   }, [clientId]);
 
-  // Buat RTCPeerConnection + Transceiver sendonly + DataChannel 'tactical-telemetry'
+  // Buat RTCPeerConnection + Transceiver sendonly + DataChannel 'tactical-telemetry' dengan sessionId unik
   const createClientPeerConnection = useCallback(
-    (stream: MediaStream | null): RTCPeerConnection => {
+    (stream: MediaStream | null, sessionId: string): RTCPeerConnection => {
       if (pcRef.current) {
         try {
           pcRef.current.onicecandidate = null;
@@ -526,10 +550,10 @@ export const Client: React.FC<ClientProps> = ({
 
       const pc = new RTCPeerConnection(RTC_CONFIG);
       pcRef.current = pc;
+      currentSessionIdRef.current = sessionId;
       pendingCandidatesRef.current = [];
       isRemoteDescReadyRef.current = false;
 
-      // Pilih stream yang sudah diperkuat GainNode 300% jika AudioContext sudah running, atau rawStream
       const activeStream =
         audioCtxRef.current?.state === 'running' &&
         amplifiedStreamRef.current &&
@@ -580,25 +604,25 @@ export const Client: React.FC<ClientProps> = ({
         } catch {}
       };
 
+      // Kirim setiap ICE Candidate melalui jalur ganda (WebSocket + HTTP /api/signal) dengan sessionId
       pc.onicecandidate = (event: RTCPeerConnectionIceEvent) => {
+        if (currentSessionIdRef.current !== sessionId) return;
         if (event.candidate && event.candidate.candidate) {
           const candidateJson = event.candidate.toJSON();
-          const candidatePacket = {
+          void sendSignalingPacket({
             type: 'candidate',
             senderId: clientId,
             targetId: 'MASTER',
+            sessionId,
+            packetId: makePacketId('c-cand'),
             candidate: candidateJson,
             data: candidateJson,
-          };
-          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-            wsRef.current.send(JSON.stringify(candidatePacket));
-          } else {
-            void postHttpSignal(candidatePacket);
-          }
+          });
         }
       };
 
       const checkConnState = () => {
+        if (pcRef.current !== pc) return;
         const st = pc.connectionState;
         const iceSt = pc.iceConnectionState;
         if (
@@ -618,115 +642,133 @@ export const Client: React.FC<ClientProps> = ({
 
       return pc;
     },
-    [clientId, postHttpSignal, transmitTelemetryPacket]
+    [clientId, sendSignalingPacket, transmitTelemetryPacket]
   );
 
-  // Kirim SDP Offer ke Master via WebSocket DAN HTTP (/api/signal)
+  // Kirim SDP Offer ke Master dengan sessionId yang cocok
   const sendOfferOverSignaling = useCallback(
-    async (pc: RTCPeerConnection) => {
+    async (pc: RTCPeerConnection, sessionId: string) => {
       if (isManualDisconnectedRef.current) return;
       try {
         isHandshakingRef.current = true;
         lastOfferSentAtRef.current = Date.now();
         const offer = await pc.createOffer();
+        if (currentSessionIdRef.current !== sessionId) return;
         await pc.setLocalDescription(offer);
 
-        if (pc.localDescription) {
+        if (pc.localDescription && currentSessionIdRef.current === sessionId) {
           const sdpObj = {
             type: pc.localDescription.type,
             sdp: pc.localDescription.sdp,
           };
-          const offerPacket = {
+          await sendSignalingPacket({
             type: 'offer',
             senderId: clientId,
             targetId: 'MASTER',
+            sessionId,
+            packetId: makePacketId('c-off'),
             sdp: sdpObj,
             data: sdpObj,
-          };
-
-          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-            wsRef.current.send(JSON.stringify(offerPacket));
-          }
-          await postHttpSignal(offerPacket);
+          });
         }
       } catch (err) {
         console.error('[CLIENT] Gagal membuat/mengirim Offer:', err);
       } finally {
         setTimeout(() => {
           isHandshakingRef.current = false;
-        }, 1200);
+        }, 1000);
       }
     },
-    [clientId, postHttpSignal]
+    [clientId, sendSignalingPacket]
   );
 
-  // Mulai atau ulangi negosiasi WebRTC
-  const startWebRTC = useCallback(async () => {
-    if (isManualDisconnectedRef.current) return;
-    const existingPc = pcRef.current;
-    const hasAudioSender = Boolean(
-      existingPc &&
-        existingPc
-          .getSenders()
-          .some(
-            (s) =>
-              s.track &&
-              s.track.kind === 'audio' &&
-              s.track.readyState === 'live'
-          )
-    );
+  // Mulai atau perbarui negosiasi WebRTC secara terkendali (tanpa double-offer race condition)
+  const startWebRTC = useCallback(
+    async (forceReset: boolean = false) => {
+      if (isManualDisconnectedRef.current) return;
 
-    if (
-      existingPc &&
-      hasAudioSender &&
-      (existingPc.connectionState === 'connected' ||
-        existingPc.iceConnectionState === 'connected' ||
-        existingPc.iceConnectionState === 'completed')
-    ) {
-      setPeerStatus('CONNECTED');
-      setStatus('TERHUBUNG KE MASTER');
-      return;
-    }
+      const existingPc = pcRef.current;
+      if (!forceReset && existingPc) {
+        const isAlreadyConnected =
+          existingPc.connectionState === 'connected' ||
+          existingPc.iceConnectionState === 'connected' ||
+          existingPc.iceConnectionState === 'completed';
 
-    const timeSinceLastOffer = Date.now() - lastOfferSentAtRef.current;
-    if (
-      existingPc &&
-      hasAudioSender &&
-      timeSinceLastOffer < 7000 &&
-      (existingPc.iceConnectionState === 'checking' ||
-        existingPc.connectionState === 'connecting' ||
-        existingPc.signalingState === 'have-local-offer')
-    ) {
-      return;
-    }
+        if (isAlreadyConnected) {
+          // Jika mikrofon sudah ada namun belum terpasang ke transceiver, pasang dengan replaceTrack tanpa menutup koneksi!
+          const bestStream =
+            audioCtxRef.current?.state === 'running' &&
+            amplifiedStreamRef.current &&
+            amplifiedStreamRef.current.getAudioTracks().length > 0
+              ? amplifiedStreamRef.current
+              : rawStreamRef.current;
+          if (bestStream && bestStream.getAudioTracks().length > 0) {
+            const track = bestStream.getAudioTracks()[0];
+            existingPc.getSenders().forEach((sender) => {
+              if (!sender.track || sender.track.kind === 'audio') {
+                sender.replaceTrack(track).catch(() => {});
+              }
+            });
+          }
+          setPeerStatus('CONNECTED');
+          setStatus('TERHUBUNG KE MASTER');
+          return;
+        }
 
-    if (isHandshakingRef.current) return;
-    isHandshakingRef.current = true;
+        const timeSinceLastOffer = Date.now() - lastOfferSentAtRef.current;
+        if (
+          timeSinceLastOffer < 10000 &&
+          (existingPc.iceConnectionState === 'checking' ||
+            existingPc.connectionState === 'connecting' ||
+            existingPc.signalingState === 'have-local-offer')
+        ) {
+          return;
+        }
+      }
 
-    try {
-      const stream =
-        rawStreamRef.current ||
-        (await Promise.race([
-          ensureMicrophoneStream(),
-          new Promise<MediaStream | null>((resolve) =>
-            setTimeout(() => resolve(rawStreamRef.current), 1500)
-          ),
-        ]));
+      if (isHandshakingRef.current && !forceReset) return;
+      isHandshakingRef.current = true;
 
-      const pc = createClientPeerConnection(stream);
-      await sendOfferOverSignaling(pc);
-    } catch {} finally {
-      setTimeout(() => {
-        isHandshakingRef.current = false;
-      }, 1000);
-    }
-  }, [createClientPeerConnection, ensureMicrophoneStream, sendOfferOverSignaling]);
+      try {
+        const stream =
+          rawStreamRef.current ||
+          (await Promise.race([
+            ensureMicrophoneStream(),
+            new Promise<MediaStream | null>((resolve) =>
+              setTimeout(() => resolve(rawStreamRef.current), 1800)
+            ),
+          ]));
+
+        const newSessionId = `sess-${Date.now()}-${Math.random()
+          .toString(36)
+          .substring(2, 7)}`;
+        const pc = createClientPeerConnection(stream, newSessionId);
+        await sendOfferOverSignaling(pc, newSessionId);
+      } catch (err) {
+        console.error('[CLIENT] Error di dalam startWebRTC():', err);
+      } finally {
+        setTimeout(() => {
+          isHandshakingRef.current = false;
+        }, 800);
+      }
+    },
+    [createClientPeerConnection, ensureMicrophoneStream, sendOfferOverSignaling]
+  );
 
   // Proses pesan masuk dari Master (via WebSocket maupun HTTP Polling)
   const processIncomingSignalingMessage = useCallback(
     async (data: SignalingMessage) => {
       if (!data || !data.type || isManualDisconnectedRef.current) return;
       if (data.targetId && data.targetId !== clientId) return;
+
+      if (typeof data.packetId === 'string' && data.packetId) {
+        if (seenPacketIdsRef.current.has(data.packetId)) return;
+        seenPacketIdsRef.current.add(data.packetId);
+        if (seenPacketIdsRef.current.size > 1000) {
+          const first = seenPacketIdsRef.current.values().next().value;
+          if (first) seenPacketIdsRef.current.delete(first);
+        }
+      }
 
       if (data.type === 'master_ack') {
         setPeerStatus('CONNECTED');
@@ -743,15 +785,21 @@ export const Client: React.FC<ClientProps> = ({
           (pc.connectionState === 'connected' ||
             pc.iceConnectionState === 'connected' ||
             pc.iceConnectionState === 'completed' ||
-            pc.iceConnectionState === 'checking' ||
-            pc.signalingState === 'have-local-offer');
-        if (
-          !alreadyActive &&
-          Date.now() - lastOfferSentAtRef.current > 2500
-        ) {
-          isHandshakingRef.current = false;
-          void startWebRTC();
+            (Date.now() - lastOfferSentAtRef.current < 4000 &&
+              (pc.iceConnectionState === 'checking' ||
+                pc.signalingState === 'have-local-offer')));
+        if (!alreadyActive) {
+          void startWebRTC(true);
         }
+        return;
+      }
+
+      // Validasi sessionId agar Answer/Candidate sesi lama tidak pernah merusak sesi RTCPeerConnection baru
+      if (
+        data.sessionId &&
+        currentSessionIdRef.current &&
+        data.sessionId !== currentSessionIdRef.current
+      ) {
         return;
       }
 
@@ -824,7 +872,7 @@ export const Client: React.FC<ClientProps> = ({
     [clientId, startWebRTC, transmitTelemetryPacket]
   );
 
-  // Siklus Utama Koneksi Otomatis ke Master (Non-Blocking & Anti-Gagal)
+  // Siklus Utama Koneksi Otomatis ke Master (Stabil, Tanpa Race Condition)
   useEffect(() => {
     let isMounted = true;
     let wsReconnectTimer: number | null = null;
@@ -833,21 +881,19 @@ export const Client: React.FC<ClientProps> = ({
 
     const connectSignalingWebSocket = () => {
       if (!isMounted || isManualDisconnectedRef.current) return;
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      if (
+        wsRef.current &&
+        (wsRef.current.readyState === WebSocket.OPEN ||
+          wsRef.current.readyState === WebSocket.CONNECTING)
+      ) {
         return;
-      }
-      if (wsRef.current && wsRef.current.readyState === WebSocket.CLOSING) {
-        try {
-          wsRef.current.close();
-        } catch {}
-        wsRef.current = null;
       }
 
       try {
         const ws = new WebSocket(getSignalingWebSocketUrl());
         wsRef.current = ws;
 
-        ws.onopen = async () => {
+        ws.onopen = () => {
           if (!isMounted || isManualDisconnectedRef.current) return;
           setPeerStatus('CONNECTED');
           setStatus('TERHUBUNG KE MASTER');
@@ -858,15 +904,15 @@ export const Client: React.FC<ClientProps> = ({
               id: clientId,
               senderId: clientId,
               targetId: 'MASTER',
+              packetId: makePacketId('c-reg-ws'),
             })
           );
           transmitTelemetryPacket();
 
-          let pc = pcRef.current;
-          if (!pc || pc.signalingState === 'closed') {
-            pc = createClientPeerConnection(rawStreamRef.current);
+          // Hanya jalankan startWebRTC bila bootstrap awal sudah selesai dan belum ada PC aktif
+          if (!isBootstrappingRef.current && !pcRef.current) {
+            void startWebRTC(false);
           }
-          await sendOfferOverSignaling(pc);
         };
 
         ws.onmessage = async (event) => {
@@ -884,7 +930,7 @@ export const Client: React.FC<ClientProps> = ({
             setStatus('TRANSMISI DIHENTIKAN (STANDBY)');
             return;
           }
-          wsReconnectTimer = window.setTimeout(connectSignalingWebSocket, 2500);
+          wsReconnectTimer = window.setTimeout(connectSignalingWebSocket, 2000);
         };
 
         ws.onerror = () => {
@@ -894,7 +940,7 @@ export const Client: React.FC<ClientProps> = ({
         };
       } catch {
         if (!isManualDisconnectedRef.current) {
-          wsReconnectTimer = window.setTimeout(connectSignalingWebSocket, 3000);
+          wsReconnectTimer = window.setTimeout(connectSignalingWebSocket, 2500);
         }
       }
     };
@@ -903,26 +949,28 @@ export const Client: React.FC<ClientProps> = ({
 
     const bootstrapClientConnection = async () => {
       if (isManualDisconnectedRef.current) return;
+      isBootstrappingRef.current = true;
 
-      // 1. Langsung daftarkan Klien via HTTP + WebSocket tanpa menunggu izin mikrofon selesai
-      void postHttpSignal({
+      // 1. Daftarkan Klien via HTTP + WebSocket dan kirim telemetri awal
+      void sendSignalingPacket({
         type: 'register',
         id: clientId,
         senderId: clientId,
         targetId: 'MASTER',
+        packetId: makePacketId('c-reg-http'),
       });
       connectSignalingWebSocket();
       transmitTelemetryPacket();
 
-      // 2. Akuisisi mikrofon + GainNode 300% dengan batas waktu aman (tidak pernah hang)
-      const stream = await ensureMicrophoneStream();
+      // 2. Akuisisi mikrofon + GainNode 300% (batas waktu 2.5 detik agar tidak pernah memblokir koneksi)
+      await ensureMicrophoneStream();
+      isBootstrappingRef.current = false;
       if (!isMounted || isManualDisconnectedRef.current) return;
 
-      // 3. Buat RTCPeerConnection dan kirim SDP Offer ke Master
-      const pc = createClientPeerConnection(stream);
-      await sendOfferOverSignaling(pc);
+      // 3. Buat SATU RTCPeerConnection dengan sessionId unik dan kirim SDP Offer ke Master
+      await startWebRTC(true);
 
-      // 4. Polling HTTP /api/signal/:clientId setiap 2 detik
+      // 4. Polling HTTP /api/signal/:clientId setiap 1.5 detik untuk menerima Answer & Candidate
       httpPollInterval = window.setInterval(async () => {
         if (!isMounted || isManualDisconnectedRef.current) return;
         try {
@@ -942,9 +990,9 @@ export const Client: React.FC<ClientProps> = ({
             }
           }
         } catch {}
-      }, 2000);
+      }, 1500);
 
-      // 5. Interval 5 detik untuk pengiriman telemetri & re-offer bila track audio belum tersambung
+      // 5. Heartbeat telemetri & pemulihan koneksi setiap 6 detik (TIDAK memutus PC yang sudah connected!)
       autoOfferInterval = window.setInterval(async () => {
         if (!isMounted || isManualDisconnectedRef.current) return;
         if (!wsRef.current || wsRef.current.readyState === WebSocket.CLOSED) {
@@ -953,29 +1001,21 @@ export const Client: React.FC<ClientProps> = ({
         transmitTelemetryPacket();
 
         const pcCurrent = pcRef.current;
-        const hasAudioTrack = Boolean(
+        const isPcHealthy = Boolean(
           pcCurrent &&
-            pcCurrent
-              .getSenders()
-              .some(
-                (s) =>
-                  s.track &&
-                  s.track.kind === 'audio' &&
-                  s.track.readyState === 'live'
-              )
-        );
-        const isPcConnected = Boolean(
-          pcCurrent &&
-            hasAudioTrack &&
             (pcCurrent.connectionState === 'connected' ||
               pcCurrent.iceConnectionState === 'connected' ||
-              pcCurrent.iceConnectionState === 'completed')
+              pcCurrent.iceConnectionState === 'completed' ||
+              (Date.now() - lastOfferSentAtRef.current < 10000 &&
+                (pcCurrent.iceConnectionState === 'checking' ||
+                  pcCurrent.connectionState === 'connecting' ||
+                  pcCurrent.signalingState === 'have-local-offer')))
         );
 
-        if (!isPcConnected) {
-          await startWebRTC();
+        if (!isPcHealthy) {
+          await startWebRTC(true);
         }
-      }, 5000);
+      }, 6000);
     };
 
     void bootstrapClientConnection();
@@ -990,8 +1030,24 @@ export const Client: React.FC<ClientProps> = ({
         ensureMicrophoneStream()
           .then((s) => {
             if (s && isMounted && !isManualDisconnectedRef.current) {
-              lastOfferSentAtRef.current = 0;
-              void startWebRTC();
+              const pc = pcRef.current;
+              const bestTrack =
+                (amplifiedStreamRef.current?.getAudioTracks()[0]) ||
+                s.getAudioTracks()[0];
+              if (
+                pc &&
+                (pc.iceConnectionState === 'connected' ||
+                  pc.iceConnectionState === 'completed') &&
+                bestTrack
+              ) {
+                pc.getSenders().forEach((sender) => {
+                  if (!sender.track || sender.track.kind === 'audio') {
+                    sender.replaceTrack(bestTrack).catch(() => {});
+                  }
+                });
+              } else {
+                void startWebRTC(true);
+              }
             }
           })
           .catch(() => {});
@@ -1018,11 +1074,9 @@ export const Client: React.FC<ClientProps> = ({
     };
   }, [
     clientId,
-    createClientPeerConnection,
     ensureMicrophoneStream,
-    postHttpSignal,
     processIncomingSignalingMessage,
-    sendOfferOverSignaling,
+    sendSignalingPacket,
     startWebRTC,
     transmitTelemetryPacket,
   ]);
@@ -1116,37 +1170,27 @@ export const Client: React.FC<ClientProps> = ({
     ) {
       wsRef.current = null;
       connectWsFnRef.current?.();
-    } else if (wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
-        JSON.stringify({
-          type: 'register',
-          id: clientId,
-          senderId: clientId,
-          targetId: 'MASTER',
-        })
-      );
     }
 
-    void postHttpSignal({
+    void sendSignalingPacket({
       type: 'register',
       id: clientId,
       senderId: clientId,
       targetId: 'MASTER',
+      packetId: makePacketId('c-reg-manual'),
     });
     transmitTelemetryPacket();
 
-    const stream = await ensureMicrophoneStream();
+    await ensureMicrophoneStream();
     if (isManualDisconnectedRef.current) return;
 
-    const pc = createClientPeerConnection(stream);
-    await sendOfferOverSignaling(pc);
+    await startWebRTC(true);
   }, [
     clientId,
-    createClientPeerConnection,
     ensureMicrophoneStream,
-    postHttpSignal,
     requestWakeLock,
-    sendOfferOverSignaling,
+    sendSignalingPacket,
+    startWebRTC,
     transmitTelemetryPacket,
   ]);
 
@@ -1162,6 +1206,7 @@ export const Client: React.FC<ClientProps> = ({
       type: 'client_disconnected',
       senderId: clientId,
       targetId: 'MASTER',
+      packetId: makePacketId('c-disc'),
     };
 
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
