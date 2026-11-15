@@ -37,50 +37,11 @@ async function startServer() {
   const masterSockets = new Set<WebSocket>();
   const socketToId = new Map<WebSocket, string>();
   const httpMailboxes = new Map<string, SignalingPayload[]>();
-  const knownClientIds = new Set<string>();
-  const processedPackets = new Map<string, number>();
-
-  const isDuplicatePacket = (packetId?: unknown): boolean => {
-    if (typeof packetId !== 'string' || !packetId) return false;
-    const now = Date.now();
-    if (processedPackets.has(packetId)) {
-      return true;
-    }
-    processedPackets.set(packetId, now);
-    if (processedPackets.size > 1500) {
-      for (const [k, ts] of processedPackets.entries()) {
-        if (now - ts > 60000) processedPackets.delete(k);
-      }
-    }
-    return false;
-  };
 
   const enqueueMailbox = (targetId: string, packet: SignalingPayload) => {
-    let queue = httpMailboxes.get(targetId) || [];
-    if (
-      packet.packetId &&
-      queue.some((item) => item.packetId === packet.packetId)
-    ) {
-      return;
-    }
-    // Jangan biarkan paket telemetri atau ack menumpuk dan menggeser paket SDP offer/answer/candidate
-    if (
-      packet.type === 'SIGMA_TELEMETRY' ||
-      packet.type === 'GPS_UPDATE' ||
-      packet.type === 'master_ack' ||
-      packet.type === 'client_registered'
-    ) {
-      queue = queue.filter(
-        (item) =>
-          !(
-            item.type === packet.type &&
-            (item.senderId || item.nodeId) ===
-              (packet.senderId || packet.nodeId)
-          )
-      );
-    }
+    const queue = httpMailboxes.get(targetId) || [];
     queue.push(packet);
-    if (queue.length > 200) queue.shift();
+    if (queue.length > 50) queue.shift();
     httpMailboxes.set(targetId, queue);
   };
 
@@ -146,9 +107,13 @@ async function startServer() {
         return;
       }
 
-      if (isDuplicatePacket(data.packetId)) {
-        return;
-      }
+      console.log(
+        `[SERVER-WS] Incoming Message -> type: "${data.type}", id: "${
+          data.id || ''
+        }", senderId: "${data.senderId || ''}", targetId: "${
+          data.targetId || data.target || ''
+        }"`
+      );
 
       // ======================================================================
       // ATURAN 1: REGISTRASI WAJIB (`{ type: "register", id: "MASTER" | myClientId }`)
@@ -165,6 +130,7 @@ async function startServer() {
             (data.type === 'register_master' ? 'MASTER' : '')
         );
         if (!rawId) {
+          console.warn('[SERVER-WS] Pesan register ditolak karena id kosong!');
           return;
         }
 
@@ -175,8 +141,6 @@ async function startServer() {
         socketToId.set(ws, normalizedId);
         if (normalizedId === 'MASTER') {
           masterSockets.add(ws);
-        } else {
-          knownClientIds.add(normalizedId);
         }
 
         console.log(
@@ -186,25 +150,27 @@ async function startServer() {
         );
 
         // Jika MASTER baru saja register, beri tahu semua Client yang sudah menunggu
+        // agar langsung mengirim ulang Offer ke MASTER
         if (normalizedId === 'MASTER') {
-          const allTargetClients = new Set<string>([
-            ...Array.from(clients.keys()),
-            ...Array.from(knownClientIds),
-          ]);
-          allTargetClients.forEach((clientId) => {
-            if (clientId === 'MASTER') return;
-            const onlineMsg: SignalingPayload = {
-              type: 'master_online',
-              senderId: 'MASTER',
-              targetId: clientId,
-            };
-            const clientWs = clients.get(clientId);
-            if (clientWs && clientWs.readyState === WebSocket.OPEN) {
-              clientWs.send(JSON.stringify(onlineMsg));
+          clients.forEach((clientWs, clientId) => {
+            if (
+              clientId !== 'MASTER' &&
+              clientWs.readyState === WebSocket.OPEN
+            ) {
+              console.log(
+                `[SERVER-WS] Memberi tahu Client "${clientId}" bahwa MASTER sudah online.`
+              );
+              clientWs.send(
+                JSON.stringify({
+                  type: 'master_online',
+                  senderId: 'MASTER',
+                  targetId: clientId,
+                })
+              );
             }
-            enqueueMailbox(clientId, onlineMsg);
           });
         } else {
+          // Segera kirim konfirmasi `master_ack` ke Client agar status HP Samsung langsung CONNECTED
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(
               JSON.stringify({
@@ -215,6 +181,7 @@ async function startServer() {
             );
           }
 
+          // Beri tahu semua socket MASTER yang aktif bahwa Client baru saja terdaftar
           const regNotify: SignalingPayload = {
             type: 'client_registered',
             senderId: normalizedId,
@@ -243,6 +210,9 @@ async function startServer() {
         );
 
         if (!isMasterOnline) {
+          console.log(
+            `[SERVER-WS] REQUEST_ROLE -> Menetapkan "${peerId}" sebagai MASTER`
+          );
           ws.send(
             JSON.stringify({
               type: 'ROLE_ASSIGNED',
@@ -252,6 +222,9 @@ async function startServer() {
             })
           );
         } else {
+          console.log(
+            `[SERVER-WS] REQUEST_ROLE -> Menetapkan "${peerId}" sebagai CLIENT`
+          );
           ws.send(
             JSON.stringify({
               type: 'ROLE_ASSIGNED',
@@ -268,15 +241,15 @@ async function startServer() {
       if (data.senderId) {
         const senderKey =
           data.senderId.toUpperCase() === 'MASTER' ? 'MASTER' : data.senderId;
-        if (senderKey !== 'MASTER') {
-          knownClientIds.add(senderKey);
-        }
         if (!clients.has(senderKey)) {
           clients.set(senderKey, ws);
           socketToId.set(ws, senderKey);
           if (senderKey === 'MASTER') {
             masterSockets.add(ws);
           }
+          console.log(
+            `[SERVER-WS] Auto-registered senderId="${senderKey}" ke dalam Map.`
+          );
         }
       }
 
@@ -285,32 +258,21 @@ async function startServer() {
       // ======================================================================
       const rawTargetId = String(data.targetId || data.target || '');
       if (!rawTargetId) {
+        console.warn(
+          `[SERVER-WS] Pesan type="${data.type}" dari "${data.senderId}" diabaikan karena tidak memiliki targetId!`
+        );
         return;
       }
 
       const targetId =
         rawTargetId.toUpperCase() === 'MASTER' ? 'MASTER' : rawTargetId;
 
+      // Normalisasi payload agar `data`, `sdp`, dan `candidate` selalu tersedia di penerima
       const normalizedPacket: SignalingPayload = {
         ...data,
         senderId:
           data.senderId?.toUpperCase() === 'MASTER' ? 'MASTER' : data.senderId,
         targetId,
-        sdp:
-          data.sdp !== undefined
-            ? data.sdp
-            : data.type === 'offer' ||
-              data.type === 'OFFER' ||
-              data.type === 'answer' ||
-              data.type === 'ANSWER'
-            ? data.data
-            : undefined,
-        candidate:
-          data.candidate !== undefined
-            ? data.candidate
-            : data.type === 'candidate' || data.type === 'ICE_CANDIDATE'
-            ? data.data
-            : undefined,
         data:
           data.data !== undefined
             ? data.data
@@ -328,8 +290,7 @@ async function startServer() {
         normalizedPacket.senderId !== 'MASTER' &&
         (data.type === 'offer' ||
           data.type === 'OFFER' ||
-          data.type === 'SIGMA_TELEMETRY' ||
-          data.type === 'GPS_UPDATE') &&
+          data.type === 'SIGMA_TELEMETRY') &&
         ws.readyState === WebSocket.OPEN
       ) {
         ws.send(
@@ -356,13 +317,31 @@ async function startServer() {
             deliveredCount++;
           }
         }
+        if (deliveredCount > 0) {
+          console.log(
+            `[SERVER-WS] ROUTING OK: "${data.type}" dari "${normalizedPacket.senderId}" -> "MASTER" (${deliveredCount} socket)`
+          );
+        } else {
+          console.warn(
+            `[SERVER-WS] ROUTING PENDING: MASTER belum aktif di Map! Menyimpan ke antrean.`
+          );
+        }
         if (data.type !== 'SIGMA_WS_AUDIO') {
           enqueueMailbox('MASTER', normalizedPacket);
         }
       } else {
         const targetWs = clients.get(targetId);
         if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+          console.log(
+            `[SERVER-WS] ROUTING OK: "${data.type}" dari "${normalizedPacket.senderId}" -> "${targetId}"`
+          );
           targetWs.send(JSON.stringify(normalizedPacket));
+        } else {
+          console.warn(
+            `[SERVER-WS] ROUTING PENDING: targetId="${targetId}" belum aktif di Map! ID yang terdaftar saat ini: [${Array.from(
+              clients.keys()
+            ).join(', ')}]`
+          );
         }
         enqueueMailbox(targetId, normalizedPacket);
       }
@@ -375,16 +354,25 @@ async function startServer() {
 
       if (closedId && clients.get(closedId) === ws) {
         if (closedId === 'MASTER' && masterSockets.size > 0) {
+          // Promosikan socket MASTER lain yang masih aktif jika ada
           const nextMasterWs = Array.from(masterSockets).find(
             (s) => s.readyState === WebSocket.OPEN
           );
           if (nextMasterWs) {
             clients.set('MASTER', nextMasterWs);
+            console.log(
+              '[SERVER-WS] Socket MASTER sekunder ditutup; socket MASTER aktif lainnya tetap dipertahankan.'
+            );
             return;
           }
         }
 
         clients.delete(closedId);
+        console.log(
+          `[SERVER-WS] DISCONNECTED: id="${closedId}" dihapus dari Map. Sisa peer: [${Array.from(
+            clients.keys()
+          ).join(', ')}]`
+        );
 
         if (closedId !== 'MASTER') {
           const disconnectNotify: SignalingPayload = {
@@ -407,7 +395,7 @@ async function startServer() {
     });
   });
 
-  // Jalur HTTP Signaling Fallback (/api/signal)
+  // Jalur HTTP Signaling Fallback (/api/signal) untuk HP Samsung / Jaringan Seluler Ketat
   app.post('/api/signal', (req, res) => {
     const data = req.body as SignalingPayload;
     if (!data || typeof data !== 'object') {
@@ -415,48 +403,16 @@ async function startServer() {
       return;
     }
 
-    if (isDuplicatePacket(data.packetId)) {
-      res.json({ ok: true, deduplicated: true, masterOnline: true });
-      return;
-    }
-
     if (
       data.type === 'register' ||
       data.type === 'REGISTER' ||
-      data.type === 'register_master' ||
       data.type === 'register_client'
     ) {
-      const rawId = String(
-        data.id ||
-          data.senderId ||
-          (data.type === 'register_master' ? 'MASTER' : '')
-      );
-      const normalizedId =
-        rawId.toUpperCase() === 'MASTER' ? 'MASTER' : rawId;
-
-      if (normalizedId === 'MASTER') {
-        const allTargetClients = new Set<string>([
-          ...Array.from(clients.keys()),
-          ...Array.from(knownClientIds),
-        ]);
-        allTargetClients.forEach((clientId) => {
-          if (clientId === 'MASTER') return;
-          const onlineMsg: SignalingPayload = {
-            type: 'master_online',
-            senderId: 'MASTER',
-            targetId: clientId,
-          };
-          const clientWs = clients.get(clientId);
-          if (clientWs && clientWs.readyState === WebSocket.OPEN) {
-            clientWs.send(JSON.stringify(onlineMsg));
-          }
-          enqueueMailbox(clientId, onlineMsg);
-        });
-      } else if (normalizedId) {
-        knownClientIds.add(normalizedId);
+      const clientId = String(data.id || data.senderId || '');
+      if (clientId && clientId.toUpperCase() !== 'MASTER') {
         const regNotify: SignalingPayload = {
           type: 'client_registered',
-          senderId: normalizedId,
+          senderId: clientId,
           targetId: 'MASTER',
         };
         masterSockets.forEach((mWs) => {
@@ -465,10 +421,10 @@ async function startServer() {
           }
         });
         enqueueMailbox('MASTER', regNotify);
-        enqueueMailbox(normalizedId, {
+        enqueueMailbox(clientId, {
           type: 'master_ack',
           senderId: 'MASTER',
-          targetId: normalizedId,
+          targetId: clientId,
         });
       }
       res.json({ ok: true, masterOnline: true });
@@ -479,30 +435,11 @@ async function startServer() {
     const targetId =
       rawTarget.toUpperCase() === 'MASTER' ? 'MASTER' : rawTarget;
 
-    if (data.senderId && data.senderId.toUpperCase() !== 'MASTER') {
-      knownClientIds.add(String(data.senderId));
-    }
-
     const normalizedPacket: SignalingPayload = {
       ...data,
       senderId:
         data.senderId?.toUpperCase() === 'MASTER' ? 'MASTER' : data.senderId,
       targetId,
-      sdp:
-        data.sdp !== undefined
-          ? data.sdp
-          : data.type === 'offer' ||
-            data.type === 'OFFER' ||
-            data.type === 'answer' ||
-            data.type === 'ANSWER'
-          ? data.data
-          : undefined,
-      candidate:
-        data.candidate !== undefined
-          ? data.candidate
-          : data.type === 'candidate' || data.type === 'ICE_CANDIDATE'
-          ? data.data
-          : undefined,
       data:
         data.data !== undefined
           ? data.data

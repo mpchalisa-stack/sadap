@@ -881,51 +881,18 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
   );
 
   const handleIncomingTelemetry = useCallback(
-    (
-      payload:
-        | TelemetryPayload
-        | {
-            type?: string;
-            nodeId?: string;
-            senderId?: string;
-            lat?: number | null;
-            lng?: number | null;
-            alt?: number | null;
-            accuracy?: number | null;
-            speed?: number | null;
-            battery?: number | null;
-            remoteMuted?: boolean;
-            timestamp?: number;
-          },
-      fallbackNodeId?: string
-    ) => {
-      if (!payload) return;
-      if (
-        payload.type !== 'SIGMA_TELEMETRY' &&
-        payload.type !== 'GPS_UPDATE'
-      ) {
-        return;
-      }
+    (payload: TelemetryPayload) => {
+      if (!payload || payload.type !== 'SIGMA_TELEMETRY' || !payload.nodeId) return;
 
-      const resolvedNodeId = String(
-        payload.nodeId || payload.senderId || fallbackNodeId || ''
-      ).replace('sigma-node-', '');
-      if (!resolvedNodeId) return;
-
-      upsertConnectedClient(resolvedNodeId, {
+      upsertConnectedClient(payload.nodeId, {
         lat: typeof payload.lat === 'number' ? payload.lat : undefined,
         lng: typeof payload.lng === 'number' ? payload.lng : undefined,
-        alt: payload.alt ?? undefined,
-        accuracy:
-          typeof payload.accuracy === 'number'
-            ? Math.round(payload.accuracy)
-            : undefined,
-        speed: payload.speed ?? undefined,
-        battery: payload.battery ?? undefined,
+        alt: payload.alt,
+        accuracy: payload.accuracy,
+        speed: payload.speed,
+        battery: payload.battery,
         remoteMuted:
-          typeof payload.remoteMuted === 'boolean'
-            ? payload.remoteMuted
-            : undefined,
+          typeof payload.remoteMuted === 'boolean' ? payload.remoteMuted : undefined,
         lastTelemetryAt: payload.timestamp || Date.now(),
       });
     },
@@ -938,67 +905,17 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
 
       const bindDataPcHandlers = () => {
         if (!conn.peerConnection) return;
-        const pc = conn.peerConnection;
 
         // 1. Pasang setupNegotiation pada RTCPeerConnection milik DataChannel
-        const negHandler = setupNegotiation(pc, {
+        const negHandler = setupNegotiation(conn.peerConnection, {
           dataChannel: conn,
           nodeId,
         });
         negotiationHandlersRef.current.set(nodeId, negHandler);
 
-        pc.onicecandidate = (iceEvent: RTCPeerConnectionIceEvent) => {
-          if (iceEvent.candidate) {
-            console.log(
-              `[MASTER-PEERJS-DATA][Node:${nodeId}] onicecandidate:`,
-              {
-                type: iceEvent.candidate.type,
-                protocol: iceEvent.candidate.protocol,
-                candidate: iceEvent.candidate.candidate,
-                iceGatheringState: pc.iceGatheringState,
-              }
-            );
-          } else {
-            console.log(
-              `[MASTER-PEERJS-DATA][Node:${nodeId}] onicecandidate -> ICE gathering complete (null candidate)`
-            );
-          }
-        };
-
-        pc.onconnectionstatechange = () => {
-          console.log(
-            `[MASTER-PEERJS-DATA][Node:${nodeId}] onconnectionstatechange -> ${pc.connectionState}`,
-            {
-              connectionState: pc.connectionState,
-              iceConnectionState: pc.iceConnectionState,
-              signalingState: pc.signalingState,
-            }
-          );
-        };
-
-        pc.oniceconnectionstatechange = () => {
-          console.log(
-            `[MASTER-PEERJS-DATA][Node:${nodeId}] oniceconnectionstatechange -> ${pc.iceConnectionState}`,
-            {
-              iceConnectionState: pc.iceConnectionState,
-              connectionState: pc.connectionState,
-              signalingState: pc.signalingState,
-            }
-          );
-        };
-
         // 2. Pasang handleIncomingAudio pada peerConnection.ontrack milik DataChannel
         // (Solusi Samsung Galaxy A26 5G ketika track audio dikirim melalui koneksi DataChannel yang sudah stabil)
-        pc.ontrack = (event: RTCTrackEvent) => {
-          console.log(
-            `[MASTER-PEERJS-DATA][Node:${nodeId}] ontrack received:`,
-            {
-              kind: event.track.kind,
-              id: event.track.id,
-              readyState: event.track.readyState,
-              streamsCount: event.streams.length,
-            }
-          );
+        conn.peerConnection.ontrack = (event: RTCTrackEvent) => {
           handleIncomingAudio(event, {
             audioId: nodeId,
             onStreamAttached: (inboundStream) => {
@@ -1092,57 +1009,7 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
           dataChannel: dataConnsRef.current.get(nodeId) || null,
           nodeId,
         });
-
-        pc.onicecandidate = (iceEvent: RTCPeerConnectionIceEvent) => {
-          if (iceEvent.candidate) {
-            console.log(
-              `[MASTER-PEERJS-MEDIA][Node:${nodeId}] onicecandidate:`,
-              {
-                type: iceEvent.candidate.type,
-                protocol: iceEvent.candidate.protocol,
-                candidate: iceEvent.candidate.candidate,
-                iceGatheringState: pc.iceGatheringState,
-              }
-            );
-          } else {
-            console.log(
-              `[MASTER-PEERJS-MEDIA][Node:${nodeId}] onicecandidate -> ICE gathering complete (null candidate)`
-            );
-          }
-        };
-
-        pc.onconnectionstatechange = () => {
-          console.log(
-            `[MASTER-PEERJS-MEDIA][Node:${nodeId}] onconnectionstatechange -> ${pc.connectionState}`,
-            {
-              connectionState: pc.connectionState,
-              iceConnectionState: pc.iceConnectionState,
-              signalingState: pc.signalingState,
-            }
-          );
-        };
-
-        pc.oniceconnectionstatechange = () => {
-          console.log(
-            `[MASTER-PEERJS-MEDIA][Node:${nodeId}] oniceconnectionstatechange -> ${pc.iceConnectionState}`,
-            {
-              iceConnectionState: pc.iceConnectionState,
-              connectionState: pc.connectionState,
-              signalingState: pc.signalingState,
-            }
-          );
-        };
-
         pc.ontrack = (event: RTCTrackEvent) => {
-          console.log(
-            `[MASTER-PEERJS-MEDIA][Node:${nodeId}] ontrack received:`,
-            {
-              kind: event.track.kind,
-              id: event.track.id,
-              readyState: event.track.readyState,
-              streamsCount: event.streams.length,
-            }
-          );
           handleIncomingAudio(event, {
             audioId: nodeId,
             onStreamAttached: (inboundStream) => {
@@ -1187,47 +1054,26 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
   );
 
   const connectToRemoteNode = useCallback(
-    (rawNodeId: string) => {
-      const cleaned = rawNodeId.trim();
-      if (!cleaned) return;
-
-      // 1. Kirim sinyal master_online via WebSocket & HTTP /api/signal agar Client langsung mengirim SDP Offer
-      const wakePacket = {
-        type: 'master_online',
-        senderId: 'MASTER',
-        targetId: cleaned,
-        packetId: `m-wake-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      };
-      console.log(
-        `[MASTER-RTC][Node:${cleaned}] Sending 'master_online' wake signal to Client (packetId=${wakePacket.packetId})`
-      );
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        try {
-          wsRef.current.send(JSON.stringify(wakePacket));
-        } catch {}
-      }
-      void fetch('/api/signal', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(wakePacket),
-      }).catch(() => {});
+    (fourDigitId: string) => {
+      const cleaned = fourDigitId.trim();
+      if (!/^\d{4}$/.test(cleaned)) return;
 
       const peer = peerRef.current;
       if (!peer || !peer.open) {
-        setConnectionBanner(
-          `MENGHUBUNGKAN KE NODE ${cleaned} VIA WEBRTC SIGNALING...`
-        );
+        setConnectionBanner('SIGNALING SERVER BELUM SIAP, COBA SESAAT LAGI...');
         return;
       }
 
       const targetPeerId = `sigma-node-${cleaned}`;
       setConnectionBanner(`MENGHUBUNGKAN KE NODE ${cleaned} (${targetPeerId})...`);
 
+      // 1. Open WebRTC DataChannel to Node
       const conn: DataConnection = peer.connect(targetPeerId, {
         reliable: true,
       });
       registerDataConnection(cleaned, conn);
 
+      // 2. Place WebRTC Media Call to Node dengan dummy audio track nyata agar SDP memiliki m=audio
       const offerStream = createMasterOfferDummyStream();
       const call: MediaConnection = peer.call(targetPeerId, offerStream);
       if (call) {
@@ -1288,6 +1134,11 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
    * ============================================================================
    * PENERIMAAN OTOMATIS MULTI-PEER (1 MASTER -> 5 KLIEN) DENGAN `useRef(new Map())`
    * ============================================================================
+   * 1. Saat Master dimuat, mendaftar ke WebSocket dengan ID `"MASTER"`.
+   * 2. Menyimpan setiap RTCPeerConnection di `peerConnections.current.set(senderId, pc)`
+   *    (`useRef(new Map())`) sehingga re-render saat Klien ke-2 masuk tidak pernah
+   *    menghapus koneksi Klien ke-1.
+   * 3. Semua jawaban (`answer`) dan `candidate` dikirim dengan `targetId: senderId`.
    */
   useEffect(() => {
     let isMounted = true;
@@ -1296,47 +1147,23 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
     const pcMap = peerConnections.current;
     const dcMap = nativeDataChannelsRef.current;
     const candQueueMap = pendingCandidatesRef.current;
-    const sessionIdMap = new Map<string, string>();
-    const lastOfferSdpMap = new Map<
-      string,
-      { sdp: string; sessionId?: string; at: number }
-    >();
-    const seenPacketIds = new Set<string>();
-
-    const makePacketId = (prefix: string) =>
-      `${prefix}-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
+    const lastOfferSdpMap = new Map<string, { sdp: string; at: number }>();
 
     const sendToClientSignaling = (packet: Record<string, unknown>) => {
-      const payload = {
-        ...packet,
-        packetId:
-          typeof packet.packetId === 'string'
-            ? packet.packetId
-            : makePacketId('m-sig'),
-      };
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         try {
-          wsRef.current.send(JSON.stringify(payload));
+          wsRef.current.send(JSON.stringify(packet));
         } catch {}
       }
       void fetch('/api/signal', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: JSON.stringify(packet),
       }).catch(() => {});
     };
 
     const handleMasterSignalingData = async (data: Record<string, unknown>) => {
       if (!isMounted || !data || typeof data.type !== 'string') return;
-
-      if (typeof data.packetId === 'string' && data.packetId) {
-        if (seenPacketIds.has(data.packetId)) return;
-        seenPacketIds.add(data.packetId);
-        if (seenPacketIds.size > 1000) {
-          const first = seenPacketIds.values().next().value;
-          if (first) seenPacketIds.delete(first);
-        }
-      }
 
       const senderId = String(
         data.senderId || data.id || data.clientId || data.nodeId || ''
@@ -1344,11 +1171,8 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
 
       if (!senderId || senderId.toUpperCase() === 'MASTER') return;
 
-      // A0. Tangani Registrasi Klien Baru (`client_registered`)
+      // A0. Tangani Registrasi Klien Baru (`client_registered`) agar Samsung/Oppo langsung muncul di Dashboard
       if (data.type === 'client_registered') {
-        console.log(
-          `[MASTER-RTC][Node:${senderId}] Client registered with signaling server (packetId=${data.packetId || 'none'})`
-        );
         handlersRef.current.upsertConnectedClient(senderId, {
           lastTelemetryAt: Date.now(),
         });
@@ -1363,11 +1187,10 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
         return;
       }
 
-      // A. Tangani Paket Telemetri GPS dari Klien (`SIGMA_TELEMETRY` atau `GPS_UPDATE`)
-      if (data.type === 'SIGMA_TELEMETRY' || data.type === 'GPS_UPDATE') {
+      // A. Tangani Paket Telemetri GPS dari Klien
+      if (data.type === 'SIGMA_TELEMETRY') {
         handlersRef.current.handleIncomingTelemetry(
-          data as unknown as TelemetryPayload,
-          senderId
+          data as unknown as TelemetryPayload
         );
         sendToClientSignaling({
           type: 'master_ack',
@@ -1377,7 +1200,7 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
         return;
       }
 
-      // A2. Tangani Stream Audio Fallback via WebSocket (`SIGMA_WS_AUDIO`)
+      // A2. Tangani Stream Audio Fallback via WebSocket (`SIGMA_WS_AUDIO`) untuk Samsung/Oppo
       if (data.type === 'SIGMA_WS_AUDIO' && Array.isArray(data.samples)) {
         try {
           const ctx = getAudioContext();
@@ -1428,9 +1251,6 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
         data.type === 'client_disconnected' ||
         data.type === 'CLIENT_DISCONNECTED'
       ) {
-        console.warn(
-          `[MASTER-RTC][Node:${senderId}] Received client_disconnected notification`
-        );
         const oldPc = pcMap.get(senderId);
         if (oldPc) {
           try {
@@ -1440,7 +1260,6 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
         }
         dcMap.delete(senderId);
         candQueueMap.delete(senderId);
-        sessionIdMap.delete(senderId);
         lastOfferSdpMap.delete(senderId);
         wsAudioStreamRef.current.delete(senderId);
         wsAudioPlayheadRef.current.delete(senderId);
@@ -1448,8 +1267,8 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
         return;
       }
 
-      // C. Terima SDP OFFER dari Klien (`{ type: "offer", senderId, targetId: "MASTER", sdp/data: offer }`)
-      const offerPayload = (data.sdp || data.data) as
+      // C. Terima SDP OFFER dari Klien (`{ type: "offer", senderId, targetId: "MASTER", data: offer }`)
+      const offerPayload = (data.data || data.sdp) as
         | RTCSessionDescriptionInit
         | undefined;
       if (
@@ -1457,105 +1276,39 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
         offerPayload &&
         offerPayload.sdp
       ) {
-        const incomingSessionId =
-          typeof data.sessionId === 'string' ? data.sessionId : undefined;
-
-        console.log(
-          `[MASTER-RTC][Node:${senderId}][${incomingSessionId || 'no-sess'}] Received SDP Offer from Client`,
-          {
-            packetId: data.packetId,
-            sdpLength: offerPayload.sdp.length,
-            hasExistingPc: pcMap.has(senderId),
-          }
-        );
-
-        // Jika Offer identik baru saja diproses, kirim ulang Answer yang sudah ada (jika ada) tanpa merusak PC aktif
+        // Cegah duplikasi Offer identik dari jalur ganda (WebSocket + HTTP /api/signal)
         const prevOffer = lastOfferSdpMap.get(senderId);
-        const existingActivePc = pcMap.get(senderId);
         if (
           prevOffer &&
           prevOffer.sdp === offerPayload.sdp &&
-          Date.now() - prevOffer.at < 4000 &&
-          existingActivePc &&
-          existingActivePc.localDescription
+          Date.now() - prevOffer.at < 3000
         ) {
-          console.log(
-            `[MASTER-RTC][Node:${senderId}][${incomingSessionId || 'no-sess'}] Duplicate SDP Offer within 4s; re-sending existing SDP Answer`,
-            {
-              connectionState: existingActivePc.connectionState,
-              iceConnectionState: existingActivePc.iceConnectionState,
-              signalingState: existingActivePc.signalingState,
-            }
-          );
-          const sdpObj = {
-            type: existingActivePc.localDescription.type,
-            sdp: existingActivePc.localDescription.sdp,
-          };
-          sendToClientSignaling({
-            type: 'answer',
-            senderId: 'MASTER',
-            targetId: senderId,
-            sessionId: incomingSessionId || prevOffer.sessionId,
-            sdp: sdpObj,
-            data: sdpObj,
-          });
           return;
         }
-
         lastOfferSdpMap.set(senderId, {
           sdp: offerPayload.sdp,
-          sessionId: incomingSessionId,
           at: Date.now(),
         });
 
-        // Jika slot pcMap penuh (5 koneksi) dan ini klien baru, bersihkan koneksi paling awal yang sudah tidak aktif
-        if (!pcMap.has(senderId) && pcMap.size >= MAX_CLIENTS) {
-          const oldestKey = pcMap.keys().next().value;
-          if (oldestKey) {
-            console.warn(
-              `[MASTER-RTC] MAX_CLIENTS (${MAX_CLIENTS}) reached; evicting oldest slot (${oldestKey}) for new client (${senderId})`
-            );
-            const stalePc = pcMap.get(oldestKey);
-            try {
-              stalePc?.close();
-            } catch {}
-            pcMap.delete(oldestKey);
-            dcMap.delete(oldestKey);
-            candQueueMap.delete(oldestKey);
-            sessionIdMap.delete(oldestKey);
-          }
+        const isExisting =
+          pcMap.has(senderId) ||
+          clientsRef.current.some((c) => c.nodeId === senderId);
+
+        if (!isExisting && pcMap.size >= MAX_CLIENTS) {
+          return;
         }
 
         const prevPc = pcMap.get(senderId);
         if (prevPc) {
-          console.log(
-            `[MASTER-RTC][Node:${senderId}] Closing previous RTCPeerConnection before handling new Offer (${incomingSessionId || 'no-sess'})`,
-            {
-              prevConnectionState: prevPc.connectionState,
-              prevIceConnectionState: prevPc.iceConnectionState,
-              prevSignalingState: prevPc.signalingState,
-            }
-          );
           try {
             prevPc.ontrack = null;
             prevPc.onicecandidate = null;
             prevPc.ondatachannel = null;
             prevPc.oniceconnectionstatechange = null;
             prevPc.onconnectionstatechange = null;
-            prevPc.onsignalingstatechange = null;
-            prevPc.onicegatheringstatechange = null;
             prevPc.close();
           } catch {}
           pcMap.delete(senderId);
-        }
-
-        // Jika sessionId berubah dari sebelumnya, bersihkan antrean candidate sesi lama
-        const prevSessionId = sessionIdMap.get(senderId);
-        if (incomingSessionId && prevSessionId && incomingSessionId !== prevSessionId) {
-          candQueueMap.set(senderId, []);
-        }
-        if (incomingSessionId) {
-          sessionIdMap.set(senderId, incomingSessionId);
         }
 
         const pc = new RTCPeerConnection(RTC_CONFIG);
@@ -1565,14 +1318,6 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
           candQueueMap.set(senderId, []);
         }
 
-        console.log(
-          `[MASTER-RTC][Node:${senderId}][${incomingSessionId || 'no-sess'}] Created RTCPeerConnection for Client`,
-          {
-            activeClientsCount: pcMap.size,
-            iceServers: RTC_CONFIG.iceServers,
-          }
-        );
-
         handlersRef.current.upsertConnectedClient(senderId, {
           lastTelemetryAt: Date.now(),
         });
@@ -1581,98 +1326,21 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
         );
 
         // Kirim ICE Candidate Master kembali spesifik ke `targetId: senderId`
-        pc.onicecandidate = (iceEvent: RTCPeerConnectionIceEvent) => {
-          if (pcMap.get(senderId) !== pc) return;
+        pc.onicecandidate = (iceEvent) => {
           if (iceEvent.candidate && iceEvent.candidate.candidate) {
             const candidateJson = iceEvent.candidate.toJSON();
-            console.log(
-              `[MASTER-RTC][Node:${senderId}][${incomingSessionId || 'no-sess'}] onicecandidate -> Local ICE candidate generated, sending to Client:`,
-              {
-                type: iceEvent.candidate.type,
-                protocol: iceEvent.candidate.protocol,
-                address: iceEvent.candidate.address,
-                port: iceEvent.candidate.port,
-                sdpMid: iceEvent.candidate.sdpMid,
-                sdpMLineIndex: iceEvent.candidate.sdpMLineIndex,
-                candidate: iceEvent.candidate.candidate,
-                iceGatheringState: pc.iceGatheringState,
-                iceConnectionState: pc.iceConnectionState,
-                connectionState: pc.connectionState,
-                signalingState: pc.signalingState,
-              }
-            );
-            sendToClientSignaling({
+            const candidatePacket = {
               type: 'candidate',
               senderId: 'MASTER',
               targetId: senderId,
-              sessionId: incomingSessionId,
-              candidate: candidateJson,
               data: candidateJson,
-            });
-          } else {
-            console.log(
-              `[MASTER-RTC][Node:${senderId}][${incomingSessionId || 'no-sess'}] onicecandidate -> ICE gathering complete (null candidate)`,
-              {
-                iceGatheringState: pc.iceGatheringState,
-                iceConnectionState: pc.iceConnectionState,
-                connectionState: pc.connectionState,
-                signalingState: pc.signalingState,
-              }
-            );
+            };
+            sendToClientSignaling(candidatePacket);
           }
-        };
-
-        pc.onicegatheringstatechange = () => {
-          if (pcMap.get(senderId) !== pc) return;
-          console.log(
-            `[MASTER-RTC][Node:${senderId}][${incomingSessionId || 'no-sess'}] onicegatheringstatechange -> ${pc.iceGatheringState}`,
-            {
-              iceGatheringState: pc.iceGatheringState,
-              iceConnectionState: pc.iceConnectionState,
-              connectionState: pc.connectionState,
-              signalingState: pc.signalingState,
-            }
-          );
-        };
-
-        pc.onsignalingstatechange = () => {
-          if (pcMap.get(senderId) !== pc) return;
-          console.log(
-            `[MASTER-RTC][Node:${senderId}][${incomingSessionId || 'no-sess'}] onsignalingstatechange -> ${pc.signalingState}`,
-            {
-              signalingState: pc.signalingState,
-              iceConnectionState: pc.iceConnectionState,
-              connectionState: pc.connectionState,
-              iceGatheringState: pc.iceGatheringState,
-            }
-          );
-        };
-
-        pc.onicecandidateerror = (event: RTCPeerConnectionIceErrorEvent) => {
-          console.warn(
-            `[MASTER-RTC][Node:${senderId}][${incomingSessionId || 'no-sess'}] onicecandidateerror:`,
-            {
-              errorCode: event.errorCode,
-              errorText: event.errorText,
-              url: event.url,
-              address: event.address,
-              port: event.port,
-            }
-          );
         };
 
         // Saat `ontrack` dari Klien masuk, tambahkan `{ id: senderId, stream }` ke `clientStreams`
         pc.ontrack = (trackEvent: RTCTrackEvent) => {
-          console.log(
-            `[MASTER-RTC][Node:${senderId}][${incomingSessionId || 'no-sess'}] ontrack -> Remote audio track received from Client:`,
-            {
-              kind: trackEvent.track.kind,
-              id: trackEvent.track.id,
-              readyState: trackEvent.track.readyState,
-              muted: trackEvent.track.muted,
-              streamsCount: trackEvent.streams?.length || 0,
-            }
-          );
           const inboundStream =
             trackEvent.streams && trackEvent.streams[0]
               ? trackEvent.streams[0]
@@ -1699,93 +1367,27 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
           );
         };
 
-        // Tangkap RTCDataChannel untuk GPS spesifik per `senderId` ('tactical-telemetry' / 'sigma-telemetry')
+        // Tangkap RTCDataChannel untuk GPS spesifik per `senderId`
         pc.ondatachannel = (dcEvent) => {
           const channel = dcEvent.channel;
           dcMap.set(senderId, channel);
-          console.log(
-            `[MASTER-RTC][Node:${senderId}][${incomingSessionId || 'no-sess'}] ondatachannel -> Received DataChannel '${channel.label}' (readyState=${channel.readyState})`
-          );
-          channel.onopen = () => {
-            console.log(
-              `[MASTER-RTC][Node:${senderId}][${incomingSessionId || 'no-sess'}] DataChannel '${channel.label}' OPEN`
-            );
-            handlersRef.current.upsertConnectedClient(senderId, {
-              lastTelemetryAt: Date.now(),
-            });
-          };
-          channel.onclose = () => {
-            console.warn(
-              `[MASTER-RTC][Node:${senderId}][${incomingSessionId || 'no-sess'}] DataChannel '${channel.label}' CLOSED`
-            );
-          };
-          channel.onerror = (dcErr) => {
-            console.error(
-              `[MASTER-RTC][Node:${senderId}][${incomingSessionId || 'no-sess'}] DataChannel '${channel.label}' ERROR:`,
-              dcErr
-            );
-          };
           channel.onmessage = (msgEv) => {
             try {
               const parsed = JSON.parse(msgEv.data) as TelemetryPayload;
-              handlersRef.current.handleIncomingTelemetry(parsed, senderId);
+              handlersRef.current.handleIncomingTelemetry(parsed);
             } catch {}
           };
-        };
-
-        pc.onconnectionstatechange = () => {
-          if (pcMap.get(senderId) !== pc) return;
-          const st = pc.connectionState;
-          const iceSt = pc.iceConnectionState;
-          console.log(
-            `[MASTER-RTC][Node:${senderId}][${incomingSessionId || 'no-sess'}] onconnectionstatechange -> ${st}`,
-            {
-              connectionState: st,
-              iceConnectionState: iceSt,
-              iceGatheringState: pc.iceGatheringState,
-              signalingState: pc.signalingState,
-            }
-          );
-          if (st === 'connected') {
-            handlersRef.current.upsertConnectedClient(senderId, {
-              hasAudioStream: true,
-              lastTelemetryAt: Date.now(),
-            });
-            setConnectionBanner(
-              `WEBRTC PEER TERHUBUNG: KLIEN (${senderId})`
-            );
-          } else if (st === 'failed' || st === 'disconnected') {
-            console.warn(
-              `[MASTER-RTC][Node:${senderId}][${incomingSessionId || 'no-sess'}] PeerConnection state degraded: ${st} (ice=${iceSt})`
-            );
-          }
         };
 
         pc.oniceconnectionstatechange = () => {
           if (pcMap.get(senderId) !== pc) return;
           const st = pc.iceConnectionState;
-          const connSt = pc.connectionState;
-          console.log(
-            `[MASTER-RTC][Node:${senderId}][${incomingSessionId || 'no-sess'}] oniceconnectionstatechange -> ${st}`,
-            {
-              iceConnectionState: st,
-              connectionState: connSt,
-              iceGatheringState: pc.iceGatheringState,
-              signalingState: pc.signalingState,
-            }
-          );
           if (st === 'connected' || st === 'completed') {
             handlersRef.current.upsertConnectedClient(senderId, {
               hasAudioStream: true,
               lastTelemetryAt: Date.now(),
             });
-            setConnectionBanner(
-              `WEBRTC ICE TERHUBUNG: KLIEN (${senderId})`
-            );
           } else if (st === 'failed' || st === 'closed') {
-            console.warn(
-              `[MASTER-RTC][Node:${senderId}][${incomingSessionId || 'no-sess'}] ICE Connection ${st}; cleaning up PC slot`
-            );
             pcMap.delete(senderId);
             dcMap.delete(senderId);
             candQueueMap.delete(senderId);
@@ -1794,76 +1396,35 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
         };
 
         try {
-          await pc.setRemoteDescription(
-            new RTCSessionDescription(offerPayload)
-          );
+          await pc.setRemoteDescription(offerPayload);
           remoteDescReadyRef.current.set(senderId, true);
-          console.log(
-            `[MASTER-RTC][Node:${senderId}][${incomingSessionId || 'no-sess'}] setRemoteDescription(offer) succeeded`,
-            {
-              signalingState: pc.signalingState,
-              queuedCandidatesCount: (candQueueMap.get(senderId) || []).length,
-            }
-          );
 
           const candidateQueue = candQueueMap.get(senderId) || [];
-          if (candidateQueue.length > 0) {
-            console.log(
-              `[MASTER-RTC][Node:${senderId}][${incomingSessionId || 'no-sess'}] Draining ${candidateQueue.length} queued remote ICE candidates from Client`
-            );
-          }
           while (candidateQueue.length > 0) {
             const nextCand = candidateQueue.shift();
             if (nextCand && nextCand.candidate) {
-              await pc
-                .addIceCandidate(new RTCIceCandidate(nextCand))
-                .then(() => {
-                  console.log(
-                    `[MASTER-RTC][Node:${senderId}][${incomingSessionId || 'no-sess'}] Applied queued remote ICE candidate:`,
-                    nextCand.candidate
-                  );
-                })
-                .catch((candErr) => {
-                  console.warn(
-                    `[MASTER-RTC][Node:${senderId}][${incomingSessionId || 'no-sess'}] Failed to apply queued remote ICE candidate:`,
-                    candErr
-                  );
-                });
+              await pc.addIceCandidate(nextCand).catch(() => {});
             }
           }
 
           const answer = await pc.createAnswer();
           await pc.setLocalDescription(answer);
-          console.log(
-            `[MASTER-RTC][Node:${senderId}][${incomingSessionId || 'no-sess'}] createAnswer() & setLocalDescription(answer) succeeded`,
-            {
-              signalingState: pc.signalingState,
-              sdpLength: pc.localDescription?.sdp?.length || 0,
-            }
-          );
 
           if (pc.localDescription) {
-            const sdpObj = {
-              type: pc.localDescription.type,
-              sdp: pc.localDescription.sdp,
-            };
-            const answerPacketId = makePacketId('m-ans');
-            console.log(
-              `[MASTER-RTC][Node:${senderId}][${incomingSessionId || 'no-sess'}] Dispatching SDP Answer to Client (packetId=${answerPacketId})`
-            );
-            sendToClientSignaling({
+            const answerPacket = {
               type: 'answer',
               senderId: 'MASTER',
               targetId: senderId,
-              sessionId: incomingSessionId,
-              packetId: answerPacketId,
-              sdp: sdpObj,
-              data: sdpObj,
-            });
+              data: {
+                type: pc.localDescription.type,
+                sdp: pc.localDescription.sdp,
+              },
+            };
+            sendToClientSignaling(answerPacket);
           }
         } catch (err) {
           console.error(
-            `[MASTER-RTC][Node:${senderId}][${incomingSessionId || 'no-sess'}] Gagal memproses Offer dari "${senderId}":`,
+            `[MASTER-WS] Gagal memproses Offer dari "${senderId}":`,
             err
           );
         }
@@ -1871,7 +1432,7 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
       }
 
       // D. ICE CANDIDATE QUEUEING (PENCEGAH RACE CONDITION):
-      const candidatePayload = (data.candidate || data.data) as
+      const candidatePayload = (data.data || data.candidate) as
         | RTCIceCandidateInit
         | undefined;
       if (
@@ -1879,54 +1440,17 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
         candidatePayload &&
         candidatePayload.candidate
       ) {
-        const candSessionId =
-          typeof data.sessionId === 'string' ? data.sessionId : undefined;
-        const activeSessionId = sessionIdMap.get(senderId);
-        if (
-          candSessionId &&
-          activeSessionId &&
-          candSessionId !== activeSessionId
-        ) {
-          console.warn(
-            `[MASTER-RTC][Node:${senderId}] Dropping remote ICE candidate for stale sessionId: incoming=${candSessionId}, active=${activeSessionId}`
-          );
-          return;
-        }
-
         const pc = pcMap.get(senderId);
         const isRemoteReady =
           Boolean(pc && pc.remoteDescription && pc.remoteDescription.type) &&
           remoteDescReadyRef.current.get(senderId) === true;
 
         if (pc && isRemoteReady) {
-          await pc
-            .addIceCandidate(new RTCIceCandidate(candidatePayload))
-            .then(() => {
-              console.log(
-                `[MASTER-RTC][Node:${senderId}][${activeSessionId || 'no-sess'}] Added remote ICE candidate from Client immediately:`,
-                {
-                  candidate: candidatePayload.candidate,
-                  sdpMid: candidatePayload.sdpMid,
-                  sdpMLineIndex: candidatePayload.sdpMLineIndex,
-                  iceConnectionState: pc.iceConnectionState,
-                  connectionState: pc.connectionState,
-                }
-              );
-            })
-            .catch((candErr) => {
-              console.warn(
-                `[MASTER-RTC][Node:${senderId}][${activeSessionId || 'no-sess'}] addIceCandidate error:`,
-                candErr
-              );
-            });
+          await pc.addIceCandidate(candidatePayload).catch(() => {});
         } else {
           const candidateQueue = candQueueMap.get(senderId) || [];
           candidateQueue.push(candidatePayload);
           candQueueMap.set(senderId, candidateQueue);
-          console.log(
-            `[MASTER-RTC][Node:${senderId}][${candSessionId || activeSessionId || 'no-sess'}] Queued remote ICE candidate from Client (PC/remoteDescription not ready yet, queueSize=${candidateQueue.length}):`,
-            candidatePayload.candidate
-          );
         }
       }
     };
@@ -1950,8 +1474,6 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
           const regPayload = {
             type: 'register',
             id: 'MASTER',
-            senderId: 'MASTER',
-            packetId: makePacketId('m-reg'),
           };
           ws.send(JSON.stringify(regPayload));
           setConnectionBanner(
@@ -1969,7 +1491,7 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
 
         ws.onclose = () => {
           if (!isMounted) return;
-          reconnectTimer = window.setTimeout(connectMasterWebSocket, 2000);
+          reconnectTimer = window.setTimeout(connectMasterWebSocket, 2500);
         };
 
         ws.onerror = () => {
@@ -1978,25 +1500,13 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
           } catch {}
         };
       } catch {
-        reconnectTimer = window.setTimeout(connectMasterWebSocket, 2500);
+        reconnectTimer = window.setTimeout(connectMasterWebSocket, 3000);
       }
     };
 
-    // Segera daftarkan MASTER via HTTP + WebSocket agar semua Klien langsung diberi tahu (`master_online`)
-    void fetch('/api/signal', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        type: 'register',
-        id: 'MASTER',
-        senderId: 'MASTER',
-        packetId: makePacketId('m-reg-http'),
-      }),
-    }).catch(() => {});
-
     connectMasterWebSocket();
 
-    // Polling HTTP /api/signal/MASTER setiap 1.5 detik untuk jaminan penerimaan sinyal
+    // Polling HTTP /api/signal/MASTER setiap 2 detik untuk menerima sinyal dari HP Samsung bila WS terhambat
     httpPollTimer = window.setInterval(async () => {
       if (!isMounted) return;
       try {
@@ -2012,7 +1522,7 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
           }
         }
       } catch {}
-    }, 1500);
+    }, 2000);
 
     return () => {
       isMounted = false;
