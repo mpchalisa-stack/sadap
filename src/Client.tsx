@@ -9,6 +9,7 @@ import {
   ArrowLeft,
   Sliders,
   ShieldCheck,
+  Radio,
 } from 'lucide-react';
 
 export interface TelemetryPayload {
@@ -32,6 +33,7 @@ export interface TelemetryPayload {
 
 interface SignalingMessage {
   type: string;
+  id?: string;
   senderId?: string;
   targetId?: string;
   target?: string;
@@ -64,6 +66,11 @@ const RTC_CONFIG: RTCConfiguration = {
       username: 'openrelayproject',
       credential: 'openrelayproject',
     },
+    {
+      urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
   ],
 };
 
@@ -78,12 +85,15 @@ export const Client: React.FC<ClientProps> = ({
 }) => {
   const [clientId] = useState<string>(() => {
     if (initialNodeId) return initialNodeId;
-    return 'SENSOR-' + Math.floor(1000 + Math.random() * 9000);
+    const randomSuffix = Math.random().toString(36).substring(2, 6).toUpperCase();
+    return `SENSOR-${randomSuffix}`;
   });
 
-  const [status, setStatus] = useState<string>('INISIALISASI...');
-  const [isTransmitting, setIsTransmitting] = useState<boolean>(false);
-  const [isConnectedToMaster, setIsConnectedToMaster] = useState<boolean>(false);
+  const [status, setStatus] = useState<string>('MENGHUBUNGKAN KE MASTER...');
+  const [peerStatus, setPeerStatus] = useState<
+    'INITIALIZING' | 'CONNECTED' | 'DISCONNECTED'
+  >('INITIALIZING');
+  const [micStatus, setMicStatus] = useState<'READY' | 'DENIED' | 'PENDING'>('PENDING');
   const [sensitivityGain, setSensitivityGain] = useState<number>(3.0); // Default 300% (3.0x)
   const [isMuted, setIsMuted] = useState<boolean>(false);
   const [audioRms, setAudioRms] = useState<number>(0);
@@ -116,12 +126,17 @@ export const Client: React.FC<ClientProps> = ({
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const dcRef = useRef<RTCDataChannel | null>(null);
   const rawStreamRef = useRef<MediaStream | null>(null);
+  const amplifiedStreamRef = useRef<MediaStream | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const gainNodeRef = useRef<GainNode | null>(null);
-  const watchIdRef = useRef<number | null>(null);
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
-  const isManualStoppedRef = useRef<boolean>(false);
+  const isRemoteDescReadyRef = useRef<boolean>(false);
+  const isHandshakingRef = useRef<boolean>(false);
+  const isManualDisconnectedRef = useRef<boolean>(false);
+  const lastOfferSentAtRef = useRef<number>(0);
+  const micInFlightRef = useRef<Promise<MediaStream | null> | null>(null);
+  const connectWsFnRef = useRef<(() => void) | null>(null);
 
   const gpsRef = useRef(gpsCoords);
   const batteryRef = useRef(batteryInfo);
@@ -135,19 +150,52 @@ export const Client: React.FC<ClientProps> = ({
   gainValueRef.current = sensitivityGain;
   mutedRef.current = isMuted;
 
-  // Perbarui nilai GainNode secara real-time saat slider sensitivitas diubah
+  // Update GainNode secara real-time saat slider sensitivitas diubah
   useEffect(() => {
     if (gainNodeRef.current) {
       gainNodeRef.current.gain.value = isMuted ? 0 : sensitivityGain;
     }
     if (rawStreamRef.current) {
-      rawStreamRef.current.getAudioTracks().forEach((track) => {
-        track.enabled = !isMuted;
+      rawStreamRef.current.getAudioTracks().forEach((t) => {
+        t.enabled = !isMuted;
+      });
+    }
+    if (amplifiedStreamRef.current) {
+      amplifiedStreamRef.current.getAudioTracks().forEach((t) => {
+        t.enabled = !isMuted;
       });
     }
   }, [sensitivityGain, isMuted]);
 
-  // Baca informasi baterai perangkat jika tersedia
+  // Wake Lock non-blocking
+  const requestWakeLock = useCallback(() => {
+    if ('wakeLock' in navigator && navigator.wakeLock) {
+      navigator.wakeLock
+        .request('screen')
+        .then((sentinel) => {
+          wakeLockRef.current = sentinel;
+        })
+        .catch(() => {});
+    }
+  }, []);
+
+  useEffect(() => {
+    requestWakeLock();
+    const onVisChange = () => {
+      if (document.visibilityState === 'visible') {
+        requestWakeLock();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisChange);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisChange);
+      if (wakeLockRef.current) {
+        wakeLockRef.current.release().catch(() => {});
+      }
+    };
+  }, [requestWakeLock]);
+
+  // Informasi Baterai
   useEffect(() => {
     const nav = navigator as unknown as {
       getBattery?: () => Promise<{
@@ -174,34 +222,33 @@ export const Client: React.FC<ClientProps> = ({
     }
   }, []);
 
-  // Fungsi kirim sinyal ke HTTP fallback (/api/signal) agar tetap tembus di jaringan seluler ketat
+  // Kirim sinyal via HTTP (/api/signal) sebagai jalur cadangan anti-gagal
   const postHttpSignal = useCallback(async (packet: Record<string, unknown>) => {
-    if (isManualStoppedRef.current) return;
+    if (isManualDisconnectedRef.current) return;
     try {
       const res = await fetch('/api/signal', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(packet),
       });
-      if (res.ok && !isManualStoppedRef.current) {
-        setIsConnectedToMaster(true);
+      if (res.ok && !isManualDisconnectedRef.current) {
+        setPeerStatus('CONNECTED');
+        setStatus('TERHUBUNG KE MASTER');
       }
     } catch {}
   }, []);
 
-  // Kirim paket koordinat GPS ke Master via DataChannel ('tactical-telemetry'), WebSocket, dan HTTP Fallback
-  const sendGpsPayloadToMaster = useCallback(
-    (
-      coords: {
-        lat: number | null;
-        lng: number | null;
-        alt: number | null;
-        accuracy: number | null;
-        speed: number | null;
-      },
-      customChannel?: RTCDataChannel | null
-    ) => {
-      if (isManualStoppedRef.current) return;
+  // Fungsi kirim Telemetri GPS & Status ke Master via DataChannel ('tactical-telemetry'), WebSocket, & HTTP
+  const transmitTelemetryPacket = useCallback(
+    (overrideCoords?: {
+      lat: number | null;
+      lng: number | null;
+      alt: number | null;
+      accuracy: number | null;
+      speed: number | null;
+    }) => {
+      if (isManualDisconnectedRef.current) return;
+      const coords = overrideCoords || gpsRef.current;
 
       const gpsUpdatePacket = {
         type: 'GPS_UPDATE',
@@ -224,6 +271,7 @@ export const Client: React.FC<ClientProps> = ({
       const sigmaTelemetryPacket: TelemetryPayload = {
         type: 'SIGMA_TELEMETRY',
         nodeId: clientId,
+        senderId: clientId,
         peerId: `sigma-node-${clientId}`,
         lat: coords.lat,
         lng: coords.lng,
@@ -239,14 +287,18 @@ export const Client: React.FC<ClientProps> = ({
         connectionStatus: 'connected',
       };
 
-      const activeDc = customChannel || dcRef.current;
-      if (activeDc && activeDc.readyState === 'open') {
+      let sentViaWsOrDc = false;
+
+      // 1. Kirim via RTCDataChannel ('tactical-telemetry')
+      if (dcRef.current && dcRef.current.readyState === 'open') {
         try {
-          activeDc.send(JSON.stringify(gpsUpdatePacket));
-          activeDc.send(JSON.stringify(sigmaTelemetryPacket));
+          dcRef.current.send(JSON.stringify(gpsUpdatePacket));
+          dcRef.current.send(JSON.stringify(sigmaTelemetryPacket));
+          sentViaWsOrDc = true;
         } catch {}
       }
 
+      // 2. Kirim via WebSocket Signaling
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         try {
           wsRef.current.send(
@@ -256,242 +308,218 @@ export const Client: React.FC<ClientProps> = ({
               targetId: 'MASTER',
             })
           );
+          sentViaWsOrDc = true;
         } catch {}
       }
 
-      void postHttpSignal({
-        ...sigmaTelemetryPacket,
-        senderId: clientId,
-        targetId: 'MASTER',
-      });
-    },
-    [clientId, postHttpSignal]
-  );
-
-  // Fungsi Transmit GPS Real-time
-  const startGpsTracking = useCallback(
-    (dataChannel?: RTCDataChannel | null) => {
-      if (!navigator.geolocation) return;
-
-      if (watchIdRef.current !== null) {
-        navigator.geolocation.clearWatch(watchIdRef.current);
-      }
-
-      navigator.geolocation.getCurrentPosition(
-        (position) => {
-          const nextCoords = {
-            lat: position.coords.latitude,
-            lng: position.coords.longitude,
-            alt:
-              position.coords.altitude !== null
-                ? Math.round(position.coords.altitude)
-                : null,
-            accuracy: Math.max(1, Math.round(position.coords.accuracy)),
-            speed:
-              position.coords.speed !== null
-                ? Math.round(position.coords.speed * 3.6)
-                : null,
-            lastUpdated: Date.now(),
-          };
-          setGpsCoords(nextCoords);
-          sendGpsPayloadToMaster(nextCoords, dataChannel);
-        },
-        () => {},
-        { enableHighAccuracy: true, maximumAge: 0, timeout: 8000 }
-      );
-
-      watchIdRef.current = navigator.geolocation.watchPosition(
-        (position) => {
-          const nextCoords = {
-            lat: position.coords.latitude,
-            lng: position.coords.longitude,
-            alt:
-              position.coords.altitude !== null
-                ? Math.round(position.coords.altitude)
-                : null,
-            accuracy: Math.max(1, Math.round(position.coords.accuracy)),
-            speed:
-              position.coords.speed !== null
-                ? Math.round(position.coords.speed * 3.6)
-                : null,
-            lastUpdated: Date.now(),
-          };
-          setGpsCoords(nextCoords);
-          sendGpsPayloadToMaster(nextCoords, dataChannel);
-        },
-        (err) => console.warn('[GPS]', err.message),
-        { enableHighAccuracy: true, maximumAge: 0, timeout: 5000 }
-      );
-    },
-    [sendGpsPayloadToMaster]
-  );
-
-  // Tangani sinyal masuk dari Master (Answer, Candidate, atau Kontrol Gain/Mute)
-  const handleSignalingMessage = useCallback(
-    async (msg: SignalingMessage) => {
-      if (!msg || !msg.type || isManualStoppedRef.current) return;
-      if (msg.targetId && msg.targetId !== clientId) return;
-
-      if (msg.type === 'master_ack' || msg.type === 'master_online') {
-        setIsConnectedToMaster(true);
-        setStatus('TERHUBUNG KE MASTER');
-        return;
-      }
-
-      const pc = pcRef.current;
-      if (!pc) return;
-
-      const sdpPayload = (msg.sdp || msg.data) as
-        | RTCSessionDescriptionInit
-        | undefined;
-      if (
-        (msg.type === 'answer' || msg.type === 'ANSWER') &&
-        sdpPayload &&
-        sdpPayload.sdp
-      ) {
-        try {
-          if (pc.signalingState === 'have-local-offer') {
-            await pc.setRemoteDescription(
-              new RTCSessionDescription(sdpPayload)
-            );
-            setIsConnectedToMaster(true);
-            setStatus('TERHUBUNG KE MASTER');
-
-            while (pendingCandidatesRef.current.length > 0) {
-              const cand = pendingCandidatesRef.current.shift();
-              if (cand && cand.candidate) {
-                await pc
-                  .addIceCandidate(new RTCIceCandidate(cand))
-                  .catch(() => {});
-              }
-            }
-          }
-        } catch (err) {
-          console.error('[CLIENT] Gagal setRemoteDescription:', err);
-        }
-        return;
-      }
-
-      const candidatePayload = (msg.candidate || msg.data) as
-        | RTCIceCandidateInit
-        | undefined;
-      if (
-        (msg.type === 'candidate' || msg.type === 'ICE_CANDIDATE') &&
-        candidatePayload &&
-        candidatePayload.candidate
-      ) {
-        try {
-          if (pc.remoteDescription && pc.remoteDescription.type) {
-            await pc.addIceCandidate(new RTCIceCandidate(candidatePayload));
-          } else {
-            pendingCandidatesRef.current.push(candidatePayload);
-          }
-        } catch {}
-        return;
-      }
-
-      if (msg.type === 'SET_GAIN' && typeof msg.value === 'number') {
-        setSensitivityGain(msg.value);
-      } else if (msg.type === 'SET_MUTE') {
-        setIsMuted(Boolean(msg.value));
+      // 3. Kirim via HTTP /api/signal agar Master selalu menerima posisi & status klien
+      if (!sentViaWsOrDc || peerStatus !== 'CONNECTED') {
+        void postHttpSignal({
+          ...sigmaTelemetryPacket,
+          senderId: clientId,
+          targetId: 'MASTER',
+        });
       }
     },
-    [clientId]
+    [clientId, peerStatus, postHttpSignal]
   );
 
-  // Fungsi Utama Transmisi Suara Sensitivitas Tinggi & GPS ke Master
-  const initiateTransmission = useCallback(async () => {
-    try {
-      isManualStoppedRef.current = false;
-      setIsTransmitting(true);
-      setStatus('MENGAKSES PERANGKAT...');
+  // Akuisisi Mikrofon & Penguatan GainNode 300% (3.0x) TANPA memblokir WebSocket/WebRTC
+  const ensureMicrophoneStream = useCallback(async (): Promise<MediaStream | null> => {
+    if (amplifiedStreamRef.current && amplifiedStreamRef.current.active) {
+      return amplifiedStreamRef.current;
+    }
+    if (rawStreamRef.current && rawStreamRef.current.active) {
+      return rawStreamRef.current;
+    }
+    if (micInFlightRef.current) {
+      return micInFlightRef.current;
+    }
 
-      // 1. WAKE LOCK (Menjaga koneksi tetap aktif saat layar menyala)
-      if ('wakeLock' in navigator && navigator.wakeLock) {
-        navigator.wakeLock
-          .request('screen')
-          .then((sentinel) => {
-            wakeLockRef.current = sentinel;
-          })
-          .catch(() => {});
+    const acquireTask = (async (): Promise<MediaStream | null> => {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        setMicStatus('DENIED');
+        return null;
       }
 
-      // 2. SETUP AUDIO SENSITIVITAS TINGGI
       let rawStream: MediaStream | null = null;
       try {
-        rawStream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: false,
-            noiseSuppression: false,
-            autoGainControl: false,
-          },
-          video: false,
-        });
+        // Coba constraint audio taktis (EC: false, NS: false, AGC: false) dengan batas waktu 3.5 detik agar tidak hang
+        rawStream = await Promise.race([
+          navigator.mediaDevices
+            .getUserMedia({
+              audio: {
+                echoCancellation: false,
+                noiseSuppression: false,
+                autoGainControl: false,
+              },
+              video: false,
+            })
+            .catch(() =>
+              navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+            ),
+          new Promise<MediaStream | null>((resolve) =>
+            setTimeout(() => resolve(null), 3500)
+          ),
+        ]);
       } catch {
-        // Fallback ke constraint audio standar bila browser seluler menolak constraint mentah
-        rawStream = await navigator.mediaDevices.getUserMedia({
-          audio: true,
-          video: false,
-        });
+        setMicStatus('DENIED');
+        return null;
       }
 
+      if (!rawStream) {
+        return null;
+      }
+
+      rawStream.getAudioTracks().forEach((track) => {
+        track.enabled = !mutedRef.current;
+      });
       rawStreamRef.current = rawStream;
+      setMicStatus('READY');
 
-      // Penguat Sinyal Digital (GainNode) - Sensitivitas Default 300% (3.0)
-      const AudioContextClass =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext: typeof AudioContext })
-          .webkitAudioContext;
-      const audioCtx = new AudioContextClass();
-      audioCtxRef.current = audioCtx;
-      if (audioCtx.state === 'suspended') {
-        await audioCtx.resume().catch(() => {});
-      }
+      // Setup AudioContext + GainNode (3.0x / 300%) tanpa await resume() agar tidak pernah hang di browser seluler
+      try {
+        const AudioContextClass =
+          window.AudioContext ||
+          (window as unknown as { webkitAudioContext: typeof AudioContext })
+            .webkitAudioContext;
+        const audioCtx = new AudioContextClass();
+        audioCtxRef.current = audioCtx;
 
-      const source = audioCtx.createMediaStreamSource(rawStream);
-      const gainNode = audioCtx.createGain();
-      gainNode.gain.value = mutedRef.current ? 0 : gainValueRef.current;
-      gainNodeRef.current = gainNode;
+        // Jangan gunakan await di sini karena mobile browser akan menahan Promise resume() sampai layar disentuh
+        if (audioCtx.state === 'suspended') {
+          audioCtx.resume().catch(() => {});
+        }
 
-      const analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 256;
+        const source = audioCtx.createMediaStreamSource(rawStream);
+        const gainNode = audioCtx.createGain();
+        gainNode.gain.value = mutedRef.current ? 0 : gainValueRef.current; // Default 3.0 (300%)
+        gainNodeRef.current = gainNode;
 
-      const destination = audioCtx.createMediaStreamDestination();
+        const analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 256;
 
-      source.connect(gainNode);
-      gainNode.connect(analyser);
-      gainNode.connect(destination);
+        const destination = audioCtx.createMediaStreamDestination();
 
-      const amplifiedStream = destination.stream;
+        source.connect(gainNode);
+        gainNode.connect(analyser);
+        gainNode.connect(destination);
 
-      // Meter level sinyal audio real-time
-      const timeData = new Uint8Array(analyser.frequencyBinCount);
-      const updateAudioMeter = () => {
+        amplifiedStreamRef.current = destination.stream;
+
+        // Bila AudioContext beralih ke running, pastikan sender WebRTC memakai track yang telah diperkuat 300%
+        audioCtx.onstatechange = () => {
+          if (
+            audioCtx.state === 'running' &&
+            pcRef.current &&
+            destination.stream.getAudioTracks().length > 0
+          ) {
+            const ampTrack = destination.stream.getAudioTracks()[0];
+            pcRef.current.getSenders().forEach((sender) => {
+              if (sender.track && sender.track.kind === 'audio') {
+                sender.replaceTrack(ampTrack).catch(() => {});
+              }
+            });
+          }
+        };
+
+        // Meter RMS lokal untuk indikator modulasi suara
+        const timeData = new Uint8Array(analyser.frequencyBinCount);
+        const updateMeter = () => {
+          if (
+            isManualDisconnectedRef.current ||
+            !rawStreamRef.current ||
+            !rawStreamRef.current.active
+          ) {
+            return;
+          }
+          analyser.getByteTimeDomainData(timeData);
+          let sum = 0;
+          for (let i = 0; i < timeData.length; i++) {
+            const norm = (timeData[i] - 128) / 128;
+            sum += norm * norm;
+          }
+          const rms = Math.min(
+            100,
+            Math.round(Math.sqrt(sum / timeData.length) * 260)
+          );
+          setAudioRms(rms);
+          requestAnimationFrame(updateMeter);
+        };
+        requestAnimationFrame(updateMeter);
+
+        // Jalur Audio Fallback via WebSocket (SIGMA_WS_AUDIO) jika UDP WebRTC terhambat
+        try {
+          const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+          const silentSink = audioCtx.createGain();
+          silentSink.gain.value = 0;
+          gainNode.connect(processor);
+          processor.connect(silentSink);
+          silentSink.connect(audioCtx.destination);
+
+          processor.onaudioprocess = (audioEv) => {
+            if (mutedRef.current || isManualDisconnectedRef.current) return;
+            const ws = wsRef.current;
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+            const pc = pcRef.current;
+            const isWebRtcConnected = Boolean(
+              pc &&
+                (pc.iceConnectionState === 'connected' ||
+                  pc.iceConnectionState === 'completed')
+            );
+            if (isWebRtcConnected) return;
+
+            const input = audioEv.inputBuffer.getChannelData(0);
+            const inRate = audioCtx.sampleRate || 48000;
+            const outRate = 16000;
+            const ratio = Math.max(1, Math.round(inRate / outRate));
+            const downsampled: number[] = [];
+            for (let i = 0; i < input.length; i += ratio) {
+              const s = Math.max(-1, Math.min(1, input[i]));
+              downsampled.push(Math.round(s * 32767));
+            }
+            if (downsampled.length > 0) {
+              ws.send(
+                JSON.stringify({
+                  type: 'SIGMA_WS_AUDIO',
+                  senderId: clientId,
+                  targetId: 'MASTER',
+                  sampleRate: Math.round(inRate / ratio),
+                  samples: downsampled,
+                })
+              );
+            }
+          };
+        } catch {}
+
         if (
-          isManualStoppedRef.current ||
-          !rawStreamRef.current ||
-          !rawStreamRef.current.active
+          audioCtx.state === 'running' &&
+          destination.stream.getAudioTracks().length > 0
         ) {
-          return;
+          return destination.stream;
         }
-        analyser.getByteTimeDomainData(timeData);
-        let sum = 0;
-        for (let i = 0; i < timeData.length; i++) {
-          const norm = (timeData[i] - 128) / 128;
-          sum += norm * norm;
-        }
-        const rms = Math.min(
-          100,
-          Math.round(Math.sqrt(sum / timeData.length) * 260)
-        );
-        setAudioRms(rms);
-        requestAnimationFrame(updateAudioMeter);
-      };
-      requestAnimationFrame(updateAudioMeter);
+      } catch {}
 
-      // 3. SETUP WEBRTC
+      return rawStream;
+    })();
+
+    micInFlightRef.current = acquireTask;
+    try {
+      return await acquireTask;
+    } finally {
+      micInFlightRef.current = null;
+    }
+  }, [clientId]);
+
+  // Buat RTCPeerConnection + Transceiver sendonly + DataChannel 'tactical-telemetry'
+  const createClientPeerConnection = useCallback(
+    (stream: MediaStream | null): RTCPeerConnection => {
       if (pcRef.current) {
         try {
+          pcRef.current.onicecandidate = null;
+          pcRef.current.onconnectionstatechange = null;
+          pcRef.current.oniceconnectionstatechange = null;
           pcRef.current.close();
         } catch {}
       }
@@ -499,43 +527,60 @@ export const Client: React.FC<ClientProps> = ({
       const pc = new RTCPeerConnection(RTC_CONFIG);
       pcRef.current = pc;
       pendingCandidatesRef.current = [];
+      isRemoteDescReadyRef.current = false;
 
-      // Masukkan stream yang sudah diperkuat ke WebRTC dengan arah sendonly
-      const tracksToSend =
-        amplifiedStream.getAudioTracks().length > 0
-          ? amplifiedStream.getAudioTracks()
-          : rawStream.getAudioTracks();
+      // Pilih stream yang sudah diperkuat GainNode 300% jika AudioContext sudah running, atau rawStream
+      const activeStream =
+        audioCtxRef.current?.state === 'running' &&
+        amplifiedStreamRef.current &&
+        amplifiedStreamRef.current.getAudioTracks().length > 0
+          ? amplifiedStreamRef.current
+          : stream || rawStreamRef.current;
 
-      tracksToSend.forEach((track) => {
-        pc.addTransceiver(track, {
-          direction: 'sendonly',
-          streams: [amplifiedStream],
+      if (activeStream && activeStream.getAudioTracks().length > 0) {
+        activeStream.getAudioTracks().forEach((track) => {
+          track.enabled = !mutedRef.current;
+          try {
+            pc.addTransceiver(track, {
+              direction: 'sendonly',
+              streams: [activeStream],
+            });
+          } catch {
+            try {
+              pc.addTrack(track, activeStream);
+            } catch {}
+          }
         });
-      });
+      } else {
+        try {
+          pc.addTransceiver('audio', { direction: 'sendonly' });
+        } catch {}
+      }
 
-      // 4. SETUP DATA CHANNEL UNTUK GPS ('tactical-telemetry')
+      // Buat DataChannel 'tactical-telemetry' untuk pengiriman posisi GPS ke Master
       const dc = pc.createDataChannel('tactical-telemetry', {
         ordered: true,
       });
       dcRef.current = dc;
 
       dc.onopen = () => {
-        setIsConnectedToMaster(true);
+        setPeerStatus('CONNECTED');
         setStatus('TERHUBUNG KE MASTER');
-        startGpsTracking(dc);
+        transmitTelemetryPacket();
       };
 
-      dc.onmessage = (ev) => {
+      dc.onmessage = (event) => {
         try {
-          const msg = JSON.parse(ev.data) as SignalingMessage;
-          void handleSignalingMessage(msg);
+          const msg = JSON.parse(event.data) as SignalingMessage;
+          if (msg.type === 'SET_GAIN' && typeof msg.value === 'number') {
+            setSensitivityGain(msg.value);
+          } else if (msg.type === 'SET_MUTE') {
+            setIsMuted(Boolean(msg.value));
+          }
         } catch {}
       };
 
-      // Mulai lacak GPS segera agar koordinat siap dikirim ke Master
-      startGpsTracking(dc);
-
-      pc.onicecandidate = (event) => {
+      pc.onicecandidate = (event: RTCPeerConnectionIceEvent) => {
         if (event.candidate && event.candidate.candidate) {
           const candidateJson = event.candidate.toJSON();
           const candidatePacket = {
@@ -547,44 +592,42 @@ export const Client: React.FC<ClientProps> = ({
           };
           if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
             wsRef.current.send(JSON.stringify(candidatePacket));
+          } else {
+            void postHttpSignal(candidatePacket);
           }
-          void postHttpSignal(candidatePacket);
         }
       };
 
-      pc.oniceconnectionstatechange = () => {
-        const st = pc.iceConnectionState;
-        if (st === 'connected' || st === 'completed') {
-          setIsConnectedToMaster(true);
+      const checkConnState = () => {
+        const st = pc.connectionState;
+        const iceSt = pc.iceConnectionState;
+        if (
+          st === 'connected' ||
+          iceSt === 'connected' ||
+          iceSt === 'completed'
+        ) {
+          isHandshakingRef.current = false;
+          setPeerStatus('CONNECTED');
           setStatus('TERHUBUNG KE MASTER');
+          transmitTelemetryPacket();
         }
       };
 
-      // 5. SETUP SIGNALING (WEBSOCKET + HTTP FALLBACK)
-      if (wsRef.current) {
-        try {
-          wsRef.current.close();
-        } catch {}
-      }
+      pc.onconnectionstatechange = checkConnState;
+      pc.oniceconnectionstatechange = checkConnState;
 
-      const ws = new WebSocket(getSignalingWebSocketUrl());
-      wsRef.current = ws;
+      return pc;
+    },
+    [clientId, postHttpSignal, transmitTelemetryPacket]
+  );
 
-      const sendInitialOffer = async () => {
-        if (isManualStoppedRef.current || pc.signalingState === 'closed') return;
-        setStatus('NEGOSIASI KONEKSI...');
-
-        const regPacket = {
-          type: 'register',
-          id: clientId,
-          senderId: clientId,
-          targetId: 'MASTER',
-        };
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify(regPacket));
-        }
-        await postHttpSignal(regPacket);
-
+  // Kirim SDP Offer ke Master via WebSocket DAN HTTP (/api/signal)
+  const sendOfferOverSignaling = useCallback(
+    async (pc: RTCPeerConnection) => {
+      if (isManualDisconnectedRef.current) return;
+      try {
+        isHandshakingRef.current = true;
+        lastOfferSentAtRef.current = Date.now();
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
 
@@ -600,41 +643,520 @@ export const Client: React.FC<ClientProps> = ({
             sdp: sdpObj,
             data: sdpObj,
           };
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify(offerPacket));
+
+          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+            wsRef.current.send(JSON.stringify(offerPacket));
           }
           await postHttpSignal(offerPacket);
         }
-      };
+      } catch (err) {
+        console.error('[CLIENT] Gagal membuat/mengirim Offer:', err);
+      } finally {
+        setTimeout(() => {
+          isHandshakingRef.current = false;
+        }, 1200);
+      }
+    },
+    [clientId, postHttpSignal]
+  );
 
-      ws.onopen = () => {
-        void sendInitialOffer();
-      };
+  // Mulai atau ulangi negosiasi WebRTC
+  const startWebRTC = useCallback(async () => {
+    if (isManualDisconnectedRef.current) return;
+    const existingPc = pcRef.current;
+    const hasAudioSender = Boolean(
+      existingPc &&
+        existingPc
+          .getSenders()
+          .some(
+            (s) =>
+              s.track &&
+              s.track.kind === 'audio' &&
+              s.track.readyState === 'live'
+          )
+    );
 
-      ws.onmessage = async (event) => {
-        try {
-          const msg = JSON.parse(event.data) as SignalingMessage;
-          await handleSignalingMessage(msg);
-        } catch {}
-      };
-
-      ws.onerror = () => {
-        // Jika WebSocket lambat/terhambat, tetap kirim Offer via HTTP signaling
-        void sendInitialOffer();
-      };
-    } catch (error) {
-      const errMsg = error instanceof Error ? error.message : String(error);
-      setStatus('MENUNGGU IZIN MIKROFON / KLIK MULAI TRANSMISI (' + errMsg + ')');
-      setIsTransmitting(false);
+    if (
+      existingPc &&
+      hasAudioSender &&
+      (existingPc.connectionState === 'connected' ||
+        existingPc.iceConnectionState === 'connected' ||
+        existingPc.iceConnectionState === 'completed')
+    ) {
+      setPeerStatus('CONNECTED');
+      setStatus('TERHUBUNG KE MASTER');
+      return;
     }
-  }, [clientId, handleSignalingMessage, postHttpSignal, startGpsTracking]);
 
-  const stopTransmission = useCallback(() => {
-    isManualStoppedRef.current = true;
-    setIsTransmitting(false);
-    setIsConnectedToMaster(false);
-    setAudioRms(0);
+    const timeSinceLastOffer = Date.now() - lastOfferSentAtRef.current;
+    if (
+      existingPc &&
+      hasAudioSender &&
+      timeSinceLastOffer < 7000 &&
+      (existingPc.iceConnectionState === 'checking' ||
+        existingPc.connectionState === 'connecting' ||
+        existingPc.signalingState === 'have-local-offer')
+    ) {
+      return;
+    }
+
+    if (isHandshakingRef.current) return;
+    isHandshakingRef.current = true;
+
+    try {
+      const stream =
+        rawStreamRef.current ||
+        (await Promise.race([
+          ensureMicrophoneStream(),
+          new Promise<MediaStream | null>((resolve) =>
+            setTimeout(() => resolve(rawStreamRef.current), 1500)
+          ),
+        ]));
+
+      const pc = createClientPeerConnection(stream);
+      await sendOfferOverSignaling(pc);
+    } catch {} finally {
+      setTimeout(() => {
+        isHandshakingRef.current = false;
+      }, 1000);
+    }
+  }, [createClientPeerConnection, ensureMicrophoneStream, sendOfferOverSignaling]);
+
+  // Proses pesan masuk dari Master (via WebSocket maupun HTTP Polling)
+  const processIncomingSignalingMessage = useCallback(
+    async (data: SignalingMessage) => {
+      if (!data || !data.type || isManualDisconnectedRef.current) return;
+      if (data.targetId && data.targetId !== clientId) return;
+
+      if (data.type === 'master_ack') {
+        setPeerStatus('CONNECTED');
+        setStatus('TERHUBUNG KE MASTER');
+        return;
+      }
+
+      if (data.type === 'master_online') {
+        setPeerStatus('CONNECTED');
+        setStatus('TERHUBUNG KE MASTER');
+        const pc = pcRef.current;
+        const alreadyActive =
+          pc &&
+          (pc.connectionState === 'connected' ||
+            pc.iceConnectionState === 'connected' ||
+            pc.iceConnectionState === 'completed' ||
+            pc.iceConnectionState === 'checking' ||
+            pc.signalingState === 'have-local-offer');
+        if (
+          !alreadyActive &&
+          Date.now() - lastOfferSentAtRef.current > 2500
+        ) {
+          isHandshakingRef.current = false;
+          void startWebRTC();
+        }
+        return;
+      }
+
+      const sdpPayload = (data.sdp || data.data) as
+        | RTCSessionDescriptionInit
+        | undefined;
+      if (
+        (data.type === 'answer' || data.type === 'ANSWER') &&
+        sdpPayload &&
+        sdpPayload.sdp &&
+        pcRef.current
+      ) {
+        try {
+          const pc = pcRef.current;
+          if (pc.signalingState === 'have-local-offer') {
+            await pc.setRemoteDescription(
+              new RTCSessionDescription(sdpPayload)
+            );
+            isRemoteDescReadyRef.current = true;
+            setPeerStatus('CONNECTED');
+            setStatus('TERHUBUNG KE MASTER');
+
+            const queue = pendingCandidatesRef.current;
+            while (queue.length > 0) {
+              const cand = queue.shift();
+              if (cand && cand.candidate) {
+                await pc
+                  .addIceCandidate(new RTCIceCandidate(cand))
+                  .catch(() => {});
+              }
+            }
+            transmitTelemetryPacket();
+          }
+        } catch (err) {
+          console.error('[CLIENT] Gagal setRemoteDescription(answer):', err);
+        }
+        return;
+      }
+
+      const candidatePayload = (data.candidate || data.data) as
+        | RTCIceCandidateInit
+        | undefined;
+      if (
+        (data.type === 'candidate' || data.type === 'ICE_CANDIDATE') &&
+        candidatePayload &&
+        candidatePayload.candidate &&
+        pcRef.current
+      ) {
+        try {
+          const pc = pcRef.current;
+          if (
+            pc.remoteDescription &&
+            pc.remoteDescription.type &&
+            isRemoteDescReadyRef.current
+          ) {
+            await pc.addIceCandidate(new RTCIceCandidate(candidatePayload));
+          } else {
+            pendingCandidatesRef.current.push(candidatePayload);
+          }
+        } catch {}
+        return;
+      }
+
+      if (data.type === 'SET_GAIN' && typeof data.value === 'number') {
+        setSensitivityGain(data.value);
+      } else if (data.type === 'SET_MUTE') {
+        setIsMuted(Boolean(data.value));
+      }
+    },
+    [clientId, startWebRTC, transmitTelemetryPacket]
+  );
+
+  // Siklus Utama Koneksi Otomatis ke Master (Non-Blocking & Anti-Gagal)
+  useEffect(() => {
+    let isMounted = true;
+    let wsReconnectTimer: number | null = null;
+    let autoOfferInterval: number | null = null;
+    let httpPollInterval: number | null = null;
+
+    const connectSignalingWebSocket = () => {
+      if (!isMounted || isManualDisconnectedRef.current) return;
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        return;
+      }
+      if (wsRef.current && wsRef.current.readyState === WebSocket.CLOSING) {
+        try {
+          wsRef.current.close();
+        } catch {}
+        wsRef.current = null;
+      }
+
+      try {
+        const ws = new WebSocket(getSignalingWebSocketUrl());
+        wsRef.current = ws;
+
+        ws.onopen = async () => {
+          if (!isMounted || isManualDisconnectedRef.current) return;
+          setPeerStatus('CONNECTED');
+          setStatus('TERHUBUNG KE MASTER');
+
+          ws.send(
+            JSON.stringify({
+              type: 'register',
+              id: clientId,
+              senderId: clientId,
+              targetId: 'MASTER',
+            })
+          );
+          transmitTelemetryPacket();
+
+          let pc = pcRef.current;
+          if (!pc || pc.signalingState === 'closed') {
+            pc = createClientPeerConnection(rawStreamRef.current);
+          }
+          await sendOfferOverSignaling(pc);
+        };
+
+        ws.onmessage = async (event) => {
+          if (!isMounted || isManualDisconnectedRef.current) return;
+          try {
+            const msg = JSON.parse(event.data) as SignalingMessage;
+            await processIncomingSignalingMessage(msg);
+          } catch {}
+        };
+
+        ws.onclose = () => {
+          if (!isMounted) return;
+          if (isManualDisconnectedRef.current) {
+            setPeerStatus('DISCONNECTED');
+            setStatus('TRANSMISI DIHENTIKAN (STANDBY)');
+            return;
+          }
+          wsReconnectTimer = window.setTimeout(connectSignalingWebSocket, 2500);
+        };
+
+        ws.onerror = () => {
+          try {
+            ws.close();
+          } catch {}
+        };
+      } catch {
+        if (!isManualDisconnectedRef.current) {
+          wsReconnectTimer = window.setTimeout(connectSignalingWebSocket, 3000);
+        }
+      }
+    };
+
+    connectWsFnRef.current = connectSignalingWebSocket;
+
+    const bootstrapClientConnection = async () => {
+      if (isManualDisconnectedRef.current) return;
+
+      // 1. Langsung daftarkan Klien via HTTP + WebSocket tanpa menunggu izin mikrofon selesai
+      void postHttpSignal({
+        type: 'register',
+        id: clientId,
+        senderId: clientId,
+        targetId: 'MASTER',
+      });
+      connectSignalingWebSocket();
+      transmitTelemetryPacket();
+
+      // 2. Akuisisi mikrofon + GainNode 300% dengan batas waktu aman (tidak pernah hang)
+      const stream = await ensureMicrophoneStream();
+      if (!isMounted || isManualDisconnectedRef.current) return;
+
+      // 3. Buat RTCPeerConnection dan kirim SDP Offer ke Master
+      const pc = createClientPeerConnection(stream);
+      await sendOfferOverSignaling(pc);
+
+      // 4. Polling HTTP /api/signal/:clientId setiap 2 detik
+      httpPollInterval = window.setInterval(async () => {
+        if (!isMounted || isManualDisconnectedRef.current) return;
+        try {
+          const res = await fetch(`/api/signal/${encodeURIComponent(clientId)}`);
+          if (!res.ok) return;
+          const payload = (await res.json()) as {
+            ok?: boolean;
+            messages?: SignalingMessage[];
+          };
+          if (payload.ok && !isManualDisconnectedRef.current) {
+            setPeerStatus('CONNECTED');
+            setStatus('TERHUBUNG KE MASTER');
+          }
+          if (Array.isArray(payload.messages)) {
+            for (const msg of payload.messages) {
+              await processIncomingSignalingMessage(msg);
+            }
+          }
+        } catch {}
+      }, 2000);
+
+      // 5. Interval 5 detik untuk pengiriman telemetri & re-offer bila track audio belum tersambung
+      autoOfferInterval = window.setInterval(async () => {
+        if (!isMounted || isManualDisconnectedRef.current) return;
+        if (!wsRef.current || wsRef.current.readyState === WebSocket.CLOSED) {
+          connectSignalingWebSocket();
+        }
+        transmitTelemetryPacket();
+
+        const pcCurrent = pcRef.current;
+        const hasAudioTrack = Boolean(
+          pcCurrent &&
+            pcCurrent
+              .getSenders()
+              .some(
+                (s) =>
+                  s.track &&
+                  s.track.kind === 'audio' &&
+                  s.track.readyState === 'live'
+              )
+        );
+        const isPcConnected = Boolean(
+          pcCurrent &&
+            hasAudioTrack &&
+            (pcCurrent.connectionState === 'connected' ||
+              pcCurrent.iceConnectionState === 'connected' ||
+              pcCurrent.iceConnectionState === 'completed')
+        );
+
+        if (!isPcConnected) {
+          await startWebRTC();
+        }
+      }, 5000);
+    };
+
+    void bootstrapClientConnection();
+
+    // Unlock AudioContext & mikrofon otomatis saat pengguna menyentuh layar
+    const unlockOnTouch = () => {
+      if (isManualDisconnectedRef.current) return;
+      if (audioCtxRef.current && audioCtxRef.current.state === 'suspended') {
+        audioCtxRef.current.resume().catch(() => {});
+      }
+      if (!rawStreamRef.current || !rawStreamRef.current.active) {
+        ensureMicrophoneStream()
+          .then((s) => {
+            if (s && isMounted && !isManualDisconnectedRef.current) {
+              lastOfferSentAtRef.current = 0;
+              void startWebRTC();
+            }
+          })
+          .catch(() => {});
+      }
+    };
+    window.addEventListener('pointerdown', unlockOnTouch, { passive: true });
+
+    return () => {
+      isMounted = false;
+      window.removeEventListener('pointerdown', unlockOnTouch);
+      if (autoOfferInterval) clearInterval(autoOfferInterval);
+      if (httpPollInterval) clearInterval(httpPollInterval);
+      if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
+      if (wsRef.current) {
+        try {
+          wsRef.current.close();
+        } catch {}
+      }
+      if (pcRef.current) {
+        try {
+          pcRef.current.close();
+        } catch {}
+      }
+    };
+  }, [
+    clientId,
+    createClientPeerConnection,
+    ensureMicrophoneStream,
+    postHttpSignal,
+    processIncomingSignalingMessage,
+    sendOfferOverSignaling,
+    startWebRTC,
+    transmitTelemetryPacket,
+  ]);
+
+  // Pelacakan GPS Real-Time (watchPosition + interval 10 detik)
+  useEffect(() => {
+    if (!('geolocation' in navigator)) return;
+
+    let watchId: number | null = null;
+
+    const fetchGps = () => {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          const nextCoords = {
+            lat: pos.coords.latitude,
+            lng: pos.coords.longitude,
+            alt:
+              pos.coords.altitude !== null
+                ? Math.round(pos.coords.altitude)
+                : null,
+            accuracy: Math.max(1, Math.round(pos.coords.accuracy)),
+            speed:
+              pos.coords.speed !== null
+                ? Math.round(pos.coords.speed * 3.6)
+                : null,
+            lastUpdated: Date.now(),
+          };
+          setGpsCoords(nextCoords);
+          transmitTelemetryPacket(nextCoords);
+        },
+        () => {
+          transmitTelemetryPacket();
+        },
+        { enableHighAccuracy: true, timeout: 8000, maximumAge: 0 }
+      );
+    };
+
+    fetchGps();
+
+    watchId = navigator.geolocation.watchPosition(
+      (pos) => {
+        const nextCoords = {
+          lat: pos.coords.latitude,
+          lng: pos.coords.longitude,
+          alt:
+            pos.coords.altitude !== null
+              ? Math.round(pos.coords.altitude)
+              : null,
+          accuracy: Math.max(1, Math.round(pos.coords.accuracy)),
+          speed:
+            pos.coords.speed !== null
+              ? Math.round(pos.coords.speed * 3.6)
+              : null,
+          lastUpdated: Date.now(),
+        };
+        setGpsCoords(nextCoords);
+        transmitTelemetryPacket(nextCoords);
+      },
+      () => {},
+      { enableHighAccuracy: true, maximumAge: 0, timeout: 5000 }
+    );
+
+    const intervalId = window.setInterval(fetchGps, 10000);
+
+    return () => {
+      if (watchId !== null) {
+        navigator.geolocation.clearWatch(watchId);
+      }
+      clearInterval(intervalId);
+    };
+  }, [transmitTelemetryPacket]);
+
+  // Tombol Manual Mulai / Re-Konek Transmisi
+  const handleManualConnect = useCallback(async () => {
+    isManualDisconnectedRef.current = false;
+    isHandshakingRef.current = false;
+    lastOfferSentAtRef.current = 0;
+
+    setPeerStatus('CONNECTED');
+    setStatus('TERHUBUNG KE MASTER');
+    requestWakeLock();
+
+    if (audioCtxRef.current && audioCtxRef.current.state === 'suspended') {
+      audioCtxRef.current.resume().catch(() => {});
+    }
+
+    if (
+      !wsRef.current ||
+      wsRef.current.readyState === WebSocket.CLOSED ||
+      wsRef.current.readyState === WebSocket.CLOSING
+    ) {
+      wsRef.current = null;
+      connectWsFnRef.current?.();
+    } else if (wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'register',
+          id: clientId,
+          senderId: clientId,
+          targetId: 'MASTER',
+        })
+      );
+    }
+
+    void postHttpSignal({
+      type: 'register',
+      id: clientId,
+      senderId: clientId,
+      targetId: 'MASTER',
+    });
+    transmitTelemetryPacket();
+
+    const stream = await ensureMicrophoneStream();
+    if (isManualDisconnectedRef.current) return;
+
+    const pc = createClientPeerConnection(stream);
+    await sendOfferOverSignaling(pc);
+  }, [
+    clientId,
+    createClientPeerConnection,
+    ensureMicrophoneStream,
+    postHttpSignal,
+    requestWakeLock,
+    sendOfferOverSignaling,
+    transmitTelemetryPacket,
+  ]);
+
+  // Tombol Manual Hentikan Transmisi
+  const handleManualDisconnect = useCallback(() => {
+    isManualDisconnectedRef.current = true;
+    isHandshakingRef.current = false;
+    setPeerStatus('DISCONNECTED');
     setStatus('TRANSMISI DIHENTIKAN (STANDBY)');
+    setAudioRms(0);
 
     const disconnectMsg = {
       type: 'client_disconnected',
@@ -653,11 +1175,6 @@ export const Client: React.FC<ClientProps> = ({
       body: JSON.stringify(disconnectMsg),
     }).catch(() => {});
 
-    if (watchIdRef.current !== null && navigator.geolocation) {
-      navigator.geolocation.clearWatch(watchIdRef.current);
-      watchIdRef.current = null;
-    }
-
     if (dcRef.current) {
       try {
         dcRef.current.close();
@@ -667,6 +1184,9 @@ export const Client: React.FC<ClientProps> = ({
 
     if (pcRef.current) {
       try {
+        pcRef.current.onicecandidate = null;
+        pcRef.current.onconnectionstatechange = null;
+        pcRef.current.oniceconnectionstatechange = null;
         pcRef.current.close();
       } catch {}
       pcRef.current = null;
@@ -678,56 +1198,7 @@ export const Client: React.FC<ClientProps> = ({
       } catch {}
       wsRef.current = null;
     }
-
-    if (rawStreamRef.current) {
-      rawStreamRef.current.getTracks().forEach((t) => t.stop());
-      rawStreamRef.current = null;
-    }
-
-    if (audioCtxRef.current) {
-      audioCtxRef.current.close().catch(() => {});
-      audioCtxRef.current = null;
-    }
   }, [clientId]);
-
-  // Otomatis jalankan saat komponen Client dibuka + polling jawaban Master setiap 2 detik
-  useEffect(() => {
-    void initiateTransmission();
-
-    const pollInterval = window.setInterval(async () => {
-      if (isManualStoppedRef.current) return;
-      try {
-        const res = await fetch(`/api/signal/${encodeURIComponent(clientId)}`);
-        if (!res.ok) return;
-        const payload = (await res.json()) as {
-          ok?: boolean;
-          messages?: SignalingMessage[];
-        };
-        if (Array.isArray(payload.messages)) {
-          for (const msg of payload.messages) {
-            await handleSignalingMessage(msg);
-          }
-        }
-      } catch {}
-    }, 2000);
-
-    const telemetryHeartbeat = window.setInterval(() => {
-      if (isManualStoppedRef.current) return;
-      sendGpsPayloadToMaster(gpsRef.current);
-    }, 5000);
-
-    return () => {
-      clearInterval(pollInterval);
-      clearInterval(telemetryHeartbeat);
-      stopTransmission();
-    };
-  }, [
-    clientId,
-    handleSignalingMessage,
-    initiateTransmission,
-    sendGpsPayloadToMaster,
-    stopTransmission,
-  ]);
 
   return (
     <div className="min-h-screen bg-[#031525] text-[#dff8ff] flex flex-col justify-between p-4 sm:p-6 select-none">
@@ -741,7 +1212,7 @@ export const Client: React.FC<ClientProps> = ({
             className="w-7 h-7 object-contain rounded-full border border-[#19d3ff]/40 bg-[#020e1a] p-0.5 shrink-0"
           />
           <span className="font-display-tactical text-lg sm:text-xl font-bold tracking-wider text-[#66ecff] whitespace-nowrap">
-            TACTICAL NET-COMM SUBDISRUDAL
+            S.I.G.M.A DISKOMLEKAU
           </span>
         </div>
 
@@ -756,7 +1227,7 @@ export const Client: React.FC<ClientProps> = ({
           </button>
           <img
             src={LOGO_PETIR}
-            alt="Logo Subdisrudal"
+            alt="Logo Diskomlekau"
             referrerPolicy="no-referrer"
             className="w-7 h-7 object-contain rounded-full border border-[#19d3ff]/40 bg-[#020e1a] p-0.5 shrink-0"
           />
@@ -768,16 +1239,17 @@ export const Client: React.FC<ClientProps> = ({
         {/* Status & Node ID Card */}
         <section className="border border-[#19d3ff]/35 bg-[#041d34]/90 rounded-lg p-5 space-y-4">
           <div className="flex items-center justify-between gap-2 text-xs">
-            <span className="font-mono-tactical text-[#66ecff] font-semibold">
-              CLIENT TRANSMITTER NODE
+            <span className="flex items-center gap-1.5 font-mono-tactical text-[#66ecff] font-semibold">
+              <Radio className="w-3.5 h-3.5 text-[#19d3ff]" />
+              <span>CLIENT TRANSMITTER NODE</span>
             </span>
             <span
               className={`font-mono-tactical font-bold ${
-                isConnectedToMaster
+                peerStatus === 'CONNECTED'
                   ? 'text-emerald-400'
-                  : isTransmitting
-                  ? 'text-amber-300'
-                  : 'text-rose-400'
+                  : peerStatus === 'DISCONNECTED'
+                  ? 'text-rose-400'
+                  : 'text-amber-300'
               }`}
             >
               {status}
@@ -790,7 +1262,16 @@ export const Client: React.FC<ClientProps> = ({
               {clientId}
             </div>
             <div className="text-xs text-slate-300">
-              Target Koneksi: <span className="font-mono-tactical text-[#66ecff]">MASTER</span> · Mode Transmisi: <span className="font-mono-tactical text-emerald-300">SENDONLY AUDIO + GPS</span>
+              Target Koneksi:{' '}
+              <span className="font-mono-tactical text-[#66ecff]">MASTER</span> ·
+              Status Mic:{' '}
+              <span className="font-mono-tactical text-emerald-300">
+                {micStatus === 'READY'
+                  ? 'AKTIF (SENDONLY)'
+                  : micStatus === 'DENIED'
+                  ? 'KETUK TOMBOL KONEK U/ IZIN MIC'
+                  : 'MENYIAPKAN...'}
+              </span>
             </div>
           </div>
 
@@ -798,21 +1279,23 @@ export const Client: React.FC<ClientProps> = ({
           <div className="grid grid-cols-2 gap-3 pt-1">
             <button
               type="button"
-              onClick={() => void initiateTransmission()}
+              onClick={() => void handleManualConnect()}
               className="flex items-center justify-center gap-2 py-3 px-4 rounded font-bold text-xs tracking-wider bg-emerald-500/20 hover:bg-emerald-500/35 border border-emerald-400 text-emerald-200 transition-colors cursor-pointer whitespace-nowrap shrink-0"
             >
               <Power className="w-4 h-4 text-emerald-400 shrink-0" />
-              <span>{isTransmitting ? 'RE-TRANSMIT' : 'MULAI TRANSMISI'}</span>
+              <span>
+                {peerStatus === 'CONNECTED' ? 'RE-KONEK MASTER' : 'KONEK MASTER'}
+              </span>
             </button>
 
             <button
               type="button"
-              onClick={stopTransmission}
-              disabled={!isTransmitting}
+              onClick={handleManualDisconnect}
+              disabled={peerStatus === 'DISCONNECTED'}
               className="flex items-center justify-center gap-2 py-3 px-4 rounded font-bold text-xs tracking-wider bg-rose-500/20 hover:bg-rose-500/35 border border-rose-400 text-rose-200 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap shrink-0"
             >
               <PowerOff className="w-4 h-4 text-rose-400 shrink-0" />
-              <span>HENTIKAN TRANSMISI</span>
+              <span>DISKONEK</span>
             </button>
           </div>
         </section>
@@ -822,7 +1305,7 @@ export const Client: React.FC<ClientProps> = ({
           <div className="flex items-center justify-between text-xs">
             <div className="flex items-center gap-2 font-semibold text-[#66ecff]">
               <Sliders className="w-4 h-4 text-[#19d3ff]" />
-              <span>PENGUAT SINYAL AUDIO (GAINNODE)</span>
+              <span>SENSITIVITAS AUDIO (GAINNODE)</span>
             </div>
             <span className="font-mono-tactical font-bold text-emerald-300 tabular-nums">
               {Math.round(sensitivityGain * 100)}% ({sensitivityGain.toFixed(1)}x)
@@ -898,7 +1381,7 @@ export const Client: React.FC<ClientProps> = ({
                 <div className="font-semibold flex items-center gap-1.5">
                   <BatteryCharging className="w-3.5 h-3.5 text-[#19d3ff]" />
                   <span>
-                    {batteryInfo.level !== null ? `${batteryInfo.level}%` : ' Aktif'}
+                    {batteryInfo.level !== null ? `${batteryInfo.level}%` : 'Aktif'}
                   </span>
                 </div>
               </div>
@@ -915,7 +1398,7 @@ export const Client: React.FC<ClientProps> = ({
       <footer className="border-t border-[#19d3ff]/20 pt-3 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-400">
         <div className="flex items-center gap-1.5">
           <ShieldCheck className="w-3.5 h-3.5 text-[#19d3ff]" />
-          <span>TACTICAL NET-COMM SUBDISRUDAL · ONE-WAY AUDIO &amp; GPS TELEMETRY</span>
+          <span>S.I.G.M.A DISKOMLEKAU · ONE-WAY AUDIO &amp; GPS TELEMETRY</span>
         </div>
         <div className="flex items-center gap-2 font-mono-tactical">
           <Activity className="w-3.5 h-3.5 text-[#19d3ff]" />

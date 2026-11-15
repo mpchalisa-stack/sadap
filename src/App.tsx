@@ -158,7 +158,7 @@ export default function App() {
             className="w-6 h-6 sm:w-7 sm:h-7 object-contain rounded-full border border-[#19d3ff]/40 bg-black p-0.5 shrink-0"
           />
           <div className="font-display-tactical text-lg sm:text-xl font-bold tracking-wider text-[#66ecff] whitespace-nowrap">
-            TACTICAL NET-COMM SUBDISRUDAL
+            S.I.G.M.A DISKOMLEKAU
           </div>
         </div>
 
@@ -202,7 +202,7 @@ export default function App() {
           <PWAInstallButton />
           <img
             src="/assets/aistudio/1794622160588-picsay_109de27f.png"
-            alt="Logo Subdisrudal"
+            alt="Logo Diskomlekau"
             referrerPolicy="no-referrer"
             className="w-6 h-6 sm:w-7 sm:h-7 object-contain rounded-full border border-[#19d3ff]/40 bg-[#041d34] p-0.5 shrink-0"
           />
@@ -213,13 +213,13 @@ export default function App() {
       <main className="my-auto max-w-5xl w-full mx-auto px-4 sm:px-8 py-8 space-y-6">
         <div className="border border-[#19d3ff]/35 bg-[#041d34]/90 rounded-lg p-6 sm:p-8 space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-[#66ecff] border-b border-[#19d3ff]/20 pb-3 font-mono-tactical">
-            <span>TACTICAL NET-COMM SUBDISRUDAL · WEBRTC AUDIO &amp; GPS TELEMETRY</span>
+            <span>S.I.G.M.A DISKOMLEKAU · WEBRTC AUDIO &amp; GPS TELEMETRY</span>
             <span>STUN: GOOGLE · GAIN: 300% (3.0x) · MAX NODES: 05</span>
           </div>
 
           <div className="space-y-2">
             <h1 className="font-display-tactical text-3xl sm:text-5xl font-bold tracking-wider text-[#66ecff]">
-              TACTICAL NET-COMM SUBDISRUDAL
+              S.I.G.M.A DISKOMLEKAU
             </h1>
             <p className="text-xs sm:text-sm text-slate-300 max-w-2xl leading-relaxed">
               Sistem transmisi suara sensitivitas tinggi satu arah (Client ke Master) dan
@@ -357,7 +357,7 @@ export default function App() {
 
       {/* Footer */}
       <footer className="border-t border-[#19d3ff]/20 bg-[#020e1a] px-4 sm:px-8 py-3 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-400">
-        <span>TACTICAL NET-COMM SUBDISRUDAL · WEBRTC P2P AUDIO &amp; GPS TELEMETRY</span>
+        <span>S.I.G.M.A DISKOMLEKAU · WEBRTC P2P AUDIO &amp; GPS TELEMETRY</span>
         <span>BARCODE PAIRING &amp; STANDALONE PWA</span>
       </footer>
     </div>
